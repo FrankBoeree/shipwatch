@@ -20,16 +20,16 @@ MODEL_PATH = os.getenv("YOLO_MODEL", "/models/yolov5n.onnx")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.45"))
 NMS_THRESHOLD = float(os.getenv("NMS_THRESHOLD", "0.45"))
 MIN_TRACK_FRAMES = int(os.getenv("MIN_TRACK_FRAMES", "4"))
-TRACK_MAX_DISTANCE = float(os.getenv("TRACK_MAX_DISTANCE", "120"))
+TRACK_MAX_DISTANCE = float(os.getenv("TRACK_MAX_DISTANCE", "150"))
 TRACK_TTL_SECONDS = float(os.getenv("TRACK_TTL_SECONDS", "4"))
 REGISTERED_TRACK_TTL_SECONDS = float(os.getenv("REGISTERED_TRACK_TTL_SECONDS", "45"))
-MIN_TRACK_DISPLACEMENT = float(os.getenv("MIN_TRACK_DISPLACEMENT", "60"))
-MIN_CENTER_SCORE = float(os.getenv("MIN_CENTER_SCORE", "0.55"))
-CENTER_ZONE_X = os.getenv("CENTER_ZONE_X", "0.2,0.8")
-CENTER_ZONE_Y = os.getenv("CENTER_ZONE_Y", "0.35,0.85")
-PASSAGE_COOLDOWN_SECONDS = float(os.getenv("PASSAGE_COOLDOWN_SECONDS", "90"))
-PASSAGE_COOLDOWN_X_DISTANCE = float(os.getenv("PASSAGE_COOLDOWN_X_DISTANCE", "200"))
-TRACK_MATCH_MIN_SCORE = float(os.getenv("TRACK_MATCH_MIN_SCORE", "0.25"))
+MIN_TRACK_DISPLACEMENT = float(os.getenv("MIN_TRACK_DISPLACEMENT", "45"))
+MIN_CENTER_SCORE = float(os.getenv("MIN_CENTER_SCORE", "0.2"))
+CENTER_ZONE_X = os.getenv("CENTER_ZONE_X", "0.1,0.9")
+CENTER_ZONE_Y = os.getenv("CENTER_ZONE_Y", "0.35,0.95")
+PASSAGE_COOLDOWN_SECONDS = float(os.getenv("PASSAGE_COOLDOWN_SECONDS", "60"))
+PASSAGE_COOLDOWN_X_DISTANCE = float(os.getenv("PASSAGE_COOLDOWN_X_DISTANCE", "80"))
+TRACK_MATCH_MIN_SCORE = float(os.getenv("TRACK_MATCH_MIN_SCORE", "0.15"))
 DETECTION_MODE = os.getenv("DETECTION_MODE", "yolo")
 SHIP_CLASS_NAMES = {"boat", "ship"}
 MOTION_MIN_AREA = int(os.getenv("MOTION_MIN_AREA", "4500"))
@@ -39,6 +39,12 @@ CARGO_MIN_AREA_RATIO = float(os.getenv("CARGO_MIN_AREA_RATIO", "0.055"))
 SMALL_MAX_WIDTH_RATIO = float(os.getenv("SMALL_MAX_WIDTH_RATIO", "0.12"))
 SAIL_MAX_ASPECT_RATIO = float(os.getenv("SAIL_MAX_ASPECT_RATIO", "0.95"))
 SHIP_TYPES = ("pleasure_craft", "cargo", "other", "unknown")
+SHIP_TYPE_LABELS = {
+    "pleasure_craft": "Pleziervaart",
+    "cargo": "Vrachtschip",
+    "other": "Overig",
+    "unknown": "Onbekend",
+}
 
 PHOTO_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -67,6 +73,7 @@ class Track:
     points: list[tuple[float, float]] = field(default_factory=list)
     best_confidence: float = 0
     best_center_score: float = 0
+    best_frame_quality: float = 0
     best_frame: np.ndarray | None = None
     best_bbox: tuple[int, int, int, int] | None = None
     last_bbox: tuple[int, int, int, int] | None = None
@@ -77,6 +84,7 @@ class Track:
 class RecentPassage:
     registered_at: float
     direction: str
+    start_x: float
     exit_x: float
 
 
@@ -275,20 +283,18 @@ def center_score(cx: float, cy: float, width: int, height: int) -> float:
 
     norm_x = cx / width
     norm_y = cy / height
-    x_score = 0.0
-    y_score = 0.0
+    target_x = (CENTER_X_MIN + CENTER_X_MAX) / 2
+    target_y = (CENTER_Y_MIN + CENTER_Y_MAX) / 2
+    x_span = max((CENTER_X_MAX - CENTER_X_MIN) / 2, 0.15)
+    y_span = max((CENTER_Y_MAX - CENTER_Y_MIN) / 2, 0.12)
 
-    if CENTER_X_MIN <= norm_x <= CENTER_X_MAX:
-        center_x = (CENTER_X_MIN + CENTER_X_MAX) / 2
-        half_span = max((CENTER_X_MAX - CENTER_X_MIN) / 2, 0.01)
-        x_score = max(0.0, 1.0 - abs(norm_x - center_x) / half_span)
+    x_score = max(0.0, 1.0 - abs(norm_x - target_x) / x_span)
+    y_score = max(0.0, 1.0 - abs(norm_y - target_y) / y_span)
+    return (x_score * 0.55) + (y_score * 0.45)
 
-    if CENTER_Y_MIN <= norm_y <= CENTER_Y_MAX:
-        center_y = (CENTER_Y_MIN + CENTER_Y_MAX) / 2
-        half_span = max((CENTER_Y_MAX - CENTER_Y_MIN) / 2, 0.01)
-        y_score = max(0.0, 1.0 - abs(norm_y - center_y) / half_span)
 
-    return min(x_score, y_score)
+def frame_quality_score(center: float, confidence: float) -> float:
+    return (center * 0.35) + (confidence * 0.65)
 
 
 def predicted_centroid(track: Track) -> tuple[float, float]:
@@ -328,12 +334,15 @@ def is_duplicate_passage(track: Track) -> bool:
     now = time.time()
     prune_recent_passages(now)
     direction = direction_for(track)
+    start_x = track.points[0][0]
     exit_x = track.points[-1][0]
 
     for item in recent_passages:
         if item.direction != direction:
             continue
-        if abs(exit_x - item.exit_x) <= PASSAGE_COOLDOWN_X_DISTANCE:
+        start_close = abs(start_x - item.start_x) <= PASSAGE_COOLDOWN_X_DISTANCE
+        exit_close = abs(exit_x - item.exit_x) <= PASSAGE_COOLDOWN_X_DISTANCE
+        if start_close and exit_close:
             return True
 
     return False
@@ -344,6 +353,7 @@ def remember_passage(track: Track) -> None:
         RecentPassage(
             registered_at=time.time(),
             direction=direction_for(track),
+            start_x=track.points[0][0],
             exit_x=track.points[-1][0],
         )
     )
@@ -412,11 +422,10 @@ def update_tracks(camera_id: str, detections: list[Detection], frame: np.ndarray
 
         frame_center_score = center_score(cx, cy, width, height)
         best_track.best_confidence = max(best_track.best_confidence, detection.confidence)
+        frame_quality = frame_quality_score(frame_center_score, detection.confidence)
 
-        if frame_center_score > best_track.best_center_score or (
-            frame_center_score == best_track.best_center_score
-            and detection.confidence >= best_track.best_confidence
-        ):
+        if frame_quality > best_track.best_frame_quality:
+            best_track.best_frame_quality = frame_quality
             best_track.best_center_score = frame_center_score
             best_track.best_bbox = detection.bbox
             best_track.best_frame = frame.copy()
@@ -440,7 +449,7 @@ def direction_for(track: Track) -> str:
     start_x = track.points[0][0]
     end_x = track.points[-1][0]
     delta = end_x - start_x
-    if abs(delta) < 30:
+    if abs(delta) < 20:
         return "unknown"
     return "left_to_right" if delta > 0 else "right_to_left"
 
@@ -470,7 +479,10 @@ def track_ready_for_registration(track: Track) -> bool:
     if direction_for(track) == "unknown":
         return False
 
-    return track.best_center_score >= MIN_CENTER_SCORE
+    if track.best_frame is None:
+        return False
+
+    return True
 
 
 def pick_registration_candidate(camera_id: str) -> Track | None:
@@ -483,13 +495,15 @@ def pick_registration_candidate(camera_id: str) -> Track | None:
     if not candidates:
         return None
 
-    return max(candidates, key=lambda track: (track.best_center_score, track.best_confidence))
+    centered = [track for track in candidates if track.best_center_score >= MIN_CENTER_SCORE]
+    pool = centered if centered else candidates
+    return max(pool, key=lambda track: (track.best_frame_quality, track.best_center_score, track.best_confidence))
 
 
 def register_track(track: Track) -> dict[str, Any]:
     passage_id = str(uuid.uuid4())
     detected_type = detected_type_for(track)
-    photo_path = save_photo(track, passage_id)
+    photo_path = save_photo(track, passage_id, detected_type)
     insert_passage(passage_id, track, photo_path, detected_type)
     track.registered = True
     remember_passage(track)
@@ -505,14 +519,35 @@ def register_track(track: Track) -> dict[str, Any]:
     }
 
 
-def draw_ship_bbox(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> None:
+def draw_ship_bbox(frame: np.ndarray, bbox: tuple[int, int, int, int], ship_type: str | None = None) -> None:
     x1, y1, x2, y2 = bbox
     thickness = max(4, int(min(frame.shape[0], frame.shape[1]) * 0.006))
     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), thickness + 4)
     cv2.rectangle(frame, (x1, y1), (x2, y2), (238, 211, 34), thickness)
 
+    if not ship_type or ship_type == "unknown":
+        return
 
-def save_photo(track: Track, passage_id: str) -> str | None:
+    label = SHIP_TYPE_LABELS.get(ship_type, ship_type)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.6, thickness / 10)
+    text_thickness = max(1, thickness // 3)
+    (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, text_thickness)
+    label_top = max(0, y1 - text_height - baseline - 8)
+    cv2.rectangle(frame, (x1, label_top), (x1 + text_width + 12, label_top + text_height + baseline + 8), (8, 47, 73), -1)
+    cv2.putText(
+        frame,
+        label,
+        (x1 + 6, label_top + text_height + 2),
+        font,
+        font_scale,
+        (236, 254, 255),
+        text_thickness,
+        cv2.LINE_AA,
+    )
+
+
+def save_photo(track: Track, passage_id: str, detected_type: str) -> str | None:
     if track.best_frame is None:
         return None
 
@@ -520,7 +555,7 @@ def save_photo(track: Track, passage_id: str) -> str | None:
     frame = track.best_frame.copy()
 
     if track.best_bbox:
-        draw_ship_bbox(frame, track.best_bbox)
+        draw_ship_bbox(frame, track.best_bbox, detected_type)
 
     cv2.imwrite(str(photo_path), frame)
     return str(photo_path)

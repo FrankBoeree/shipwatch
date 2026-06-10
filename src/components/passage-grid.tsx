@@ -1,7 +1,8 @@
 import Link from "next/link";
 import { CameraFrame } from "@/components/camera-frame";
+import { ShipTypeBadge } from "@/components/ship-type-badge";
 import type { Passage } from "@/lib/types";
-import { formatDateTime, formatPercent, labelDirection, labelShipType } from "@/lib/format";
+import { formatDateTime, formatPercent, labelDirection } from "@/lib/format";
 
 export function PassageGrid({ passages }: { passages: Passage[] }) {
   return (
@@ -23,6 +24,9 @@ export function PassageGrid({ passages }: { passages: Passage[] }) {
             ) : (
               <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-500">Geen foto beschikbaar</div>
             )}
+            <div className="absolute left-3 top-3 z-10">
+              <ShipTypeBadge type={passage.detectedType} className="shadow-sm" />
+            </div>
           </CameraFrame>
           <div className="p-4">
             <div className="flex items-start justify-between gap-3">
@@ -37,7 +41,9 @@ export function PassageGrid({ passages }: { passages: Passage[] }) {
             <dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
               <div>
                 <dt className="text-xs font-medium uppercase text-slate-500">Type</dt>
-                <dd className="mt-1 text-slate-900">{labelShipType(passage.detectedType)}</dd>
+                <dd className="mt-1">
+                  <ShipTypeBadge type={passage.detectedType} />
+                </dd>
               </div>
               <div>
                 <dt className="text-xs font-medium uppercase text-slate-500">Richting</dt>

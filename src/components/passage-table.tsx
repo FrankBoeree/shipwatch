@@ -1,6 +1,7 @@
 import Link from "next/link";
+import { ShipTypeBadge } from "@/components/ship-type-badge";
 import type { Passage } from "@/lib/types";
-import { formatDateTime, formatPercent, labelDirection, labelShipType } from "@/lib/format";
+import { formatDateTime, formatPercent, labelDirection } from "@/lib/format";
 
 export function PassageTable({ passages }: { passages: Passage[] }) {
   return (
@@ -47,7 +48,9 @@ export function PassageTable({ passages }: { passages: Passage[] }) {
                 </Link>
                 {passage.mmsi ? <span className="block text-xs text-slate-500">MMSI {passage.mmsi}</span> : null}
               </td>
-              <td className="px-4 py-3">{labelShipType(passage.detectedType)}</td>
+              <td className="px-4 py-3">
+                <ShipTypeBadge type={passage.detectedType} />
+              </td>
               <td className="px-4 py-3">{labelDirection(passage.direction)}</td>
               <td className="px-4 py-3">{formatPercent(passage.detectionConfidence)}</td>
               <td className="px-4 py-3 capitalize">{passage.identificationStatus}</td>

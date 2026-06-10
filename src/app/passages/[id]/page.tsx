@@ -1,8 +1,9 @@
 import { notFound } from "next/navigation";
 import { AppShell } from "@/components/app-shell";
 import { CameraImage, CameraPlaceholder } from "@/components/camera-frame";
+import { ShipTypeBadge } from "@/components/ship-type-badge";
 import { getPassage } from "@/lib/db";
-import { formatDateTime, formatPercent, labelDirection, labelShipType } from "@/lib/format";
+import { formatDateTime, formatPercent, labelDirection } from "@/lib/format";
 export const revalidate = 15;
 
 export default async function PassageDetailPage({ params }: { params: Promise<{ id: string }> }) {
@@ -35,7 +36,9 @@ export default async function PassageDetailPage({ params }: { params: Promise<{ 
             </div>
             <div>
               <dt className="font-medium text-slate-500">Type</dt>
-              <dd className="mt-1 text-slate-950">{labelShipType(passage.detectedType)}</dd>
+              <dd className="mt-1">
+                <ShipTypeBadge type={passage.detectedType} />
+              </dd>
             </div>
             <div>
               <dt className="font-medium text-slate-500">Richting</dt>

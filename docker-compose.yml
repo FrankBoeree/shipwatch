@@ -24,11 +24,11 @@ services:
       REGISTER_MOTION_PASSAGES: "false"
       MOTION_MIN_AREA: "1000"
       MIN_TRACK_FRAMES: "4"
-      MIN_TRACK_DISPLACEMENT: "60"
+      MIN_TRACK_DISPLACEMENT: "45"
       TRACK_TTL_SECONDS: "15"
       REGISTERED_TRACK_TTL_SECONDS: "45"
-      MIN_CENTER_SCORE: "0.55"
-      PASSAGE_COOLDOWN_SECONDS: "90"
+      MIN_CENTER_SCORE: "0.2"
+      PASSAGE_COOLDOWN_SECONDS: "60"
       CAPTURE_ORIGINS: http://localhost:3003,http://127.0.0.1:3003,http://localhost:3000,http://127.0.0.1:3000
     ports:
       - "8000:8000"
@@ -50,11 +50,11 @@ services:
       DETECTION_MODE: yolo
       YOLO_MODEL: /models/yolov5n.onnx
       MIN_TRACK_FRAMES: "4"
-      MIN_TRACK_DISPLACEMENT: "60"
+      MIN_TRACK_DISPLACEMENT: "45"
       TRACK_TTL_SECONDS: "15"
       REGISTERED_TRACK_TTL_SECONDS: "45"
-      MIN_CENTER_SCORE: "0.55"
-      PASSAGE_COOLDOWN_SECONDS: "90"
+      MIN_CENTER_SCORE: "0.2"
+      PASSAGE_COOLDOWN_SECONDS: "60"
       CAPTURE_ORIGINS: http://localhost:3003,http://127.0.0.1:3003,http://localhost:3000,http://127.0.0.1:3000
     ports:
       - "8001:8000"

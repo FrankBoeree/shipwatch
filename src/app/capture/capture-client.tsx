@@ -4,6 +4,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Camera, CircleStop, ShipWheel, Upload } from "lucide-react";
 import { CameraFrame } from "@/components/camera-frame";
 import { CAMERA_FRAME_HEIGHT, CAMERA_FRAME_WIDTH } from "@/lib/camera";
+import { labelShipType } from "@/lib/format";
+import { classifyShipTypeFromBbox } from "@/lib/ship-classifier";
+import type { ShipType } from "@/lib/types";
 
 type Bbox = [number, number, number, number];
 
@@ -54,7 +57,7 @@ function mapBboxToDisplay(
   return [x1 * scale + offsetX, y1 * scale + offsetY, x2 * scale + offsetX, y2 * scale + offsetY];
 }
 
-function drawShipBbox(ctx: CanvasRenderingContext2D, [x1, y1, x2, y2]: Bbox) {
+function drawShipBbox(ctx: CanvasRenderingContext2D, [x1, y1, x2, y2]: Bbox, shipType?: ShipType) {
   const width = x2 - x1;
   const height = y2 - y1;
   const lineWidth = Math.max(3, Math.round(Math.min(ctx.canvas.width, ctx.canvas.height) * 0.005));
@@ -66,6 +69,23 @@ function drawShipBbox(ctx: CanvasRenderingContext2D, [x1, y1, x2, y2]: Bbox) {
   ctx.strokeStyle = "#22d3ee";
   ctx.lineWidth = lineWidth;
   ctx.strokeRect(x1, y1, width, height);
+
+  if (!shipType || shipType === "unknown") {
+    return;
+  }
+
+  const label = labelShipType(shipType);
+  const fontSize = Math.max(14, Math.round(lineWidth * 4));
+  ctx.font = `600 ${fontSize}px system-ui, sans-serif`;
+  const padding = Math.max(4, Math.round(fontSize * 0.25));
+  const textWidth = ctx.measureText(label).width;
+  const labelHeight = fontSize + padding * 2;
+  const labelY = Math.max(0, y1 - labelHeight - 2);
+
+  ctx.fillStyle = "rgba(8, 47, 73, 0.92)";
+  ctx.fillRect(x1, labelY, textWidth + padding * 2, labelHeight);
+  ctx.fillStyle = "#ecfeff";
+  ctx.fillText(label, x1 + padding, labelY + fontSize);
 }
 
 function drawLiveDetections(
@@ -96,7 +116,7 @@ function drawLiveDetections(
   }
 }
 
-async function annotatePhotoBlob(blob: Blob, bbox: Bbox): Promise<Blob> {
+async function annotatePhotoBlob(blob: Blob, bbox: Bbox, shipType?: ShipType): Promise<Blob> {
   const bitmap = await createImageBitmap(blob);
   const canvas = document.createElement("canvas");
   canvas.width = bitmap.width;
@@ -109,7 +129,7 @@ async function annotatePhotoBlob(blob: Blob, bbox: Bbox): Promise<Blob> {
   }
 
   ctx.drawImage(bitmap, 0, 0);
-  drawShipBbox(ctx, bbox);
+  drawShipBbox(ctx, bbox, shipType);
   bitmap.close();
 
   return new Promise((resolve) => {
@@ -197,8 +217,25 @@ export function CaptureClient() {
     return new URL(path, syncApiUrl || window.location.origin).toString();
   }, [syncApiUrl]);
 
-  const syncPassage = useCallback(async (
+  const resolveDetectedType = useCallback((
     passage: NonNullable<DetectionResponse["passage"]>,
+    bbox: Bbox | null,
+    frameWidth: number,
+    frameHeight: number,
+  ): ShipType => {
+    if (passage.detectedType && passage.detectedType !== "unknown") {
+      return passage.detectedType as ShipType;
+    }
+
+    if (bbox && frameWidth > 0 && frameHeight > 0) {
+      return classifyShipTypeFromBbox(bbox, frameWidth, frameHeight);
+    }
+
+    return "unknown";
+  }, []);
+
+  const syncPassage = useCallback(async (
+    passage: NonNullable<DetectionResponse["passage"]> & { detectedType: ShipType },
     frameBlob: Blob | null,
   ) => {
     const response = await fetch(syncUrl("/api/sync/passage"), {
@@ -212,7 +249,7 @@ export function CaptureClient() {
         occurredAt: new Date().toISOString(),
         direction: passage.direction,
         detectionConfidence: passage.confidence,
-        detectedType: passage.detectedType ?? "unknown",
+        detectedType: passage.detectedType,
         identificationStatus: "unknown",
         photoUrl: null,
       }),
@@ -242,11 +279,7 @@ export function CaptureClient() {
       }
     }
 
-    setStatus(
-      passage.detectedType
-        ? `Passage gesynchroniseerd: ${passage.id} (${passage.detectedType})`
-        : `Passage gesynchroniseerd: ${passage.id}`,
-    );
+    setStatus(`Passage gesynchroniseerd: ${passage.id} (${labelShipType(passage.detectedType)})`);
   }, [syncToken, syncUrl]);
 
   const sendFrame = useCallback(async (syncSnapshot: boolean) => {
@@ -273,8 +306,11 @@ export function CaptureClient() {
       if (payload.passage && !syncedPassageIdsRef.current.has(payload.passage.id)) {
         syncedPassageIdsRef.current.add(payload.passage.id);
         const bbox = pickPassageBbox(payload.passage, payload.detections);
-        const photoBlob = bbox ? await annotatePhotoBlob(blob, bbox) : blob;
-        await syncPassage(payload.passage, photoBlob);
+        const frameWidth = videoRef.current?.videoWidth ?? 0;
+        const frameHeight = videoRef.current?.videoHeight ?? 0;
+        const detectedType = resolveDetectedType(payload.passage, bbox, frameWidth, frameHeight);
+        const photoBlob = bbox ? await annotatePhotoBlob(blob, bbox, detectedType) : blob;
+        await syncPassage({ ...payload.passage, detectedType }, photoBlob);
       }
 
       if (syncSnapshot) {
@@ -297,7 +333,7 @@ export function CaptureClient() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Detector niet bereikbaar");
     }
-  }, [captureBlob, detectorUrl, syncPassage, syncToken, syncUrl]);
+  }, [captureBlob, detectorUrl, resolveDetectedType, syncPassage, syncToken, syncUrl]);
 
   useEffect(() => {
     setSyncToken(window.localStorage.getItem("shipwatch-sync-token") ?? "");
