@@ -10,23 +10,26 @@ import type { ShipType } from "@/lib/types";
 
 type Bbox = [number, number, number, number];
 
+type PassagePayload = {
+  id: string;
+  direction: string;
+  confidence: number;
+  detectedType?: string;
+  photoPath?: string | null;
+  bbox?: Bbox | null;
+};
+
 type DetectionResponse = {
   detections?: Array<{ label: string; confidence: number; bbox: Bbox }>;
-  passage?: {
-    id: string;
-    direction: string;
-    confidence: number;
-    detectedType?: string;
-    photoPath?: string | null;
-    bbox?: Bbox | null;
-  } | null;
+  passages?: PassagePayload[];
+  passage?: PassagePayload | null;
   registrationEnabled?: boolean;
   registrationMode?: string;
   error?: string;
 };
 
 function pickPassageBbox(
-  passage: NonNullable<DetectionResponse["passage"]>,
+  passage: PassagePayload,
   detections: DetectionResponse["detections"],
 ): Bbox | null {
   if (passage.bbox) {
@@ -303,14 +306,18 @@ export function CaptureClient() {
         setStatus(payload.error ?? "Detector gaf een fout terug");
       }
 
-      if (payload.passage && !syncedPassageIdsRef.current.has(payload.passage.id)) {
-        syncedPassageIdsRef.current.add(payload.passage.id);
-        const bbox = pickPassageBbox(payload.passage, payload.detections);
+      const newPassages = (payload.passages?.length ? payload.passages : payload.passage ? [payload.passage] : []).filter(
+        (passage) => !syncedPassageIdsRef.current.has(passage.id),
+      );
+
+      for (const passage of newPassages) {
+        syncedPassageIdsRef.current.add(passage.id);
+        const bbox = pickPassageBbox(passage, payload.detections);
         const frameWidth = videoRef.current?.videoWidth ?? 0;
         const frameHeight = videoRef.current?.videoHeight ?? 0;
-        const detectedType = resolveDetectedType(payload.passage, bbox, frameWidth, frameHeight);
+        const detectedType = resolveDetectedType(passage, bbox, frameWidth, frameHeight);
         const photoBlob = bbox ? await annotatePhotoBlob(blob, bbox, detectedType) : blob;
-        await syncPassage({ ...payload.passage, detectedType }, photoBlob);
+        await syncPassage({ ...passage, detectedType }, photoBlob);
       }
 
       if (syncSnapshot) {

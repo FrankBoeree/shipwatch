@@ -29,6 +29,7 @@ CENTER_ZONE_X = os.getenv("CENTER_ZONE_X", "0.1,0.9")
 CENTER_ZONE_Y = os.getenv("CENTER_ZONE_Y", "0.35,0.95")
 PASSAGE_COOLDOWN_SECONDS = float(os.getenv("PASSAGE_COOLDOWN_SECONDS", "60"))
 PASSAGE_COOLDOWN_X_DISTANCE = float(os.getenv("PASSAGE_COOLDOWN_X_DISTANCE", "80"))
+PASSAGE_COOLDOWN_Y_DISTANCE = float(os.getenv("PASSAGE_COOLDOWN_Y_DISTANCE", "70"))
 TRACK_MATCH_MIN_SCORE = float(os.getenv("TRACK_MATCH_MIN_SCORE", "0.15"))
 DETECTION_MODE = os.getenv("DETECTION_MODE", "yolo")
 SHIP_CLASS_NAMES = {"boat", "ship"}
@@ -86,6 +87,8 @@ class RecentPassage:
     direction: str
     start_x: float
     exit_x: float
+    start_y: float
+    exit_y: float
 
 
 tracks: dict[str, Track] = {}
@@ -334,14 +337,20 @@ def is_duplicate_passage(track: Track) -> bool:
     now = time.time()
     prune_recent_passages(now)
     direction = direction_for(track)
-    start_x = track.points[0][0]
-    exit_x = track.points[-1][0]
+    start_x, start_y = track.points[0]
+    exit_x, exit_y = track.points[-1]
 
     for item in recent_passages:
         if item.direction != direction:
             continue
-        start_close = abs(start_x - item.start_x) <= PASSAGE_COOLDOWN_X_DISTANCE
-        exit_close = abs(exit_x - item.exit_x) <= PASSAGE_COOLDOWN_X_DISTANCE
+        start_close = (
+            abs(start_x - item.start_x) <= PASSAGE_COOLDOWN_X_DISTANCE
+            and abs(start_y - item.start_y) <= PASSAGE_COOLDOWN_Y_DISTANCE
+        )
+        exit_close = (
+            abs(exit_x - item.exit_x) <= PASSAGE_COOLDOWN_X_DISTANCE
+            and abs(exit_y - item.exit_y) <= PASSAGE_COOLDOWN_Y_DISTANCE
+        )
         if start_close and exit_close:
             return True
 
@@ -355,8 +364,45 @@ def remember_passage(track: Track) -> None:
             direction=direction_for(track),
             start_x=track.points[0][0],
             exit_x=track.points[-1][0],
+            start_y=track.points[0][1],
+            exit_y=track.points[-1][1],
         )
     )
+
+
+def assign_detections_to_tracks(
+    camera_id: str,
+    detections: list[Detection],
+    width: int,
+    height: int,
+) -> list[tuple[Detection, Track | None]]:
+    """Match detections to existing tracks globally so nearby ships don't swap IDs."""
+    candidate_tracks = [
+        track
+        for track in tracks.values()
+        if track.camera_id == camera_id and track.points
+    ]
+
+    scored_pairs: list[tuple[float, int, str]] = []
+    for detection_index, detection in enumerate(detections):
+        for track in candidate_tracks:
+            score = track_match_score(track, detection, width, height)
+            if score > TRACK_MATCH_MIN_SCORE:
+                scored_pairs.append((score, detection_index, track.id))
+
+    scored_pairs.sort(reverse=True)
+    matched_detection_indexes: set[int] = set()
+    matched_track_ids: set[str] = set()
+    assignments: list[Track | None] = [None] * len(detections)
+
+    for _, detection_index, track_id in scored_pairs:
+        if detection_index in matched_detection_indexes or track_id in matched_track_ids:
+            continue
+        assignments[detection_index] = tracks[track_id]
+        matched_detection_indexes.add(detection_index)
+        matched_track_ids.add(track_id)
+
+    return [(detections[index], assignments[index]) for index in range(len(detections))]
 
 
 def classify_ship_type(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> str:
@@ -394,28 +440,15 @@ def update_tracks(camera_id: str, detections: list[Detection], frame: np.ndarray
 
     height, width = frame.shape[:2]
     changed: list[Track] = []
-    matched_track_ids: set[str] = set()
-    ordered_detections = sorted(detections, key=lambda item: item.confidence, reverse=True)
 
-    for detection in ordered_detections:
+    for detection, matched_track in assign_detections_to_tracks(camera_id, detections, width, height):
         cx, cy = centroid(detection.bbox)
-        best_track: Track | None = None
-        best_score = TRACK_MATCH_MIN_SCORE
-
-        for track in tracks.values():
-            if track.camera_id != camera_id or track.id in matched_track_ids or not track.points:
-                continue
-
-            score = track_match_score(track, detection, width, height)
-            if score > best_score:
-                best_score = score
-                best_track = track
+        best_track = matched_track
 
         if best_track is None:
             best_track = Track(id=str(uuid.uuid4()), camera_id=camera_id, first_seen=now, last_seen=now)
             tracks[best_track.id] = best_track
 
-        matched_track_ids.add(best_track.id)
         best_track.points.append((cx, cy))
         best_track.last_seen = now
         best_track.last_bbox = detection.bbox
@@ -485,7 +518,7 @@ def track_ready_for_registration(track: Track) -> bool:
     return True
 
 
-def pick_registration_candidate(camera_id: str) -> Track | None:
+def pick_registration_candidates(camera_id: str) -> list[Track]:
     candidates = [
         track
         for track in tracks.values()
@@ -493,11 +526,15 @@ def pick_registration_candidate(camera_id: str) -> Track | None:
     ]
 
     if not candidates:
-        return None
+        return []
 
     centered = [track for track in candidates if track.best_center_score >= MIN_CENTER_SCORE]
     pool = centered if centered else candidates
-    return max(pool, key=lambda track: (track.best_frame_quality, track.best_center_score, track.best_confidence))
+    return sorted(
+        pool,
+        key=lambda track: (track.best_frame_quality, track.best_center_score, track.best_confidence),
+        reverse=True,
+    )
 
 
 def register_track(track: Track) -> dict[str, Any]:
@@ -616,6 +653,7 @@ def health():
         "centerZoneX": [CENTER_X_MIN, CENTER_X_MAX],
         "centerZoneY": [CENTER_Y_MIN, CENTER_Y_MAX],
         "passageCooldownSeconds": PASSAGE_COOLDOWN_SECONDS,
+        "passageCooldownYDistance": PASSAGE_COOLDOWN_Y_DISTANCE,
         "shipTypeClassification": "heuristic",
         "shipTypes": list(SHIP_TYPES),
     }
@@ -627,7 +665,7 @@ async def detect_frame(frame: UploadFile = File(...), cameraId: str = Form("loca
     image = decode_frame(contents)
     detections = detect_motion(cameraId, image) if DETECTION_MODE == "motion" else detect_ships(image)
     update_tracks(cameraId, detections, image)
-    passage = None
+    passages: list[dict[str, Any]] = []
     registration_enabled = DETECTION_MODE == "yolo" or REGISTER_MOTION_PASSAGES
 
     if not registration_enabled:
@@ -635,12 +673,11 @@ async def detect_frame(frame: UploadFile = File(...), cameraId: str = Form("loca
             if track.camera_id == cameraId and not track.registered and len(track.points) >= MIN_TRACK_FRAMES:
                 track.registered = True
     else:
-        candidate = pick_registration_candidate(cameraId)
-        if candidate is not None:
+        for candidate in pick_registration_candidates(cameraId):
             if is_duplicate_passage(candidate):
                 candidate.registered = True
             else:
-                passage = register_track(candidate)
+                passages.append(register_track(candidate))
 
     return {
         "cameraId": cameraId,
@@ -648,7 +685,8 @@ async def detect_frame(frame: UploadFile = File(...), cameraId: str = Form("loca
             {"label": item.label, "confidence": round(item.confidence, 4), "bbox": list(item.bbox)}
             for item in detections
         ],
-        "passage": passage,
+        "passages": passages,
+        "passage": passages[0] if passages else None,
         "registrationEnabled": registration_enabled,
         "registrationMode": "debug_motion_only" if not registration_enabled else DETECTION_MODE,
         "tracks": debug_tracks_for(cameraId),
