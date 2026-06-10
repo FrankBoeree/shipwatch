@@ -1,0 +1,63 @@
+services:
+  db-local:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: shipwatch
+      POSTGRES_USER: shipwatch
+      POSTGRES_PASSWORD: shipwatch
+    ports:
+      - "5432:5432"
+    volumes:
+      - shipwatch-db:/var/lib/postgresql/data
+      - ./docker/local-init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+
+  detector:
+    build:
+      context: .
+      dockerfile: detector/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://shipwatch:shipwatch@db-local:5432/shipwatch
+      PHOTO_DIR: /data/photos
+      WATER_ROI: 0,0.35,1,1
+      CONFIDENCE_THRESHOLD: "0.45"
+      DETECTION_MODE: motion
+      REGISTER_MOTION_PASSAGES: "false"
+      MOTION_MIN_AREA: "1000"
+      MIN_TRACK_FRAMES: "4"
+      MIN_TRACK_DISPLACEMENT: "60"
+      TRACK_TTL_SECONDS: "15"
+      REGISTERED_TRACK_TTL_SECONDS: "45"
+      CAPTURE_ORIGINS: http://localhost:3003,http://127.0.0.1:3003,http://localhost:3000,http://127.0.0.1:3000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/photos:/data/photos
+    depends_on:
+      - db-local
+
+  detector-yolo:
+    build:
+      context: .
+      dockerfile: detector/Dockerfile.yolo
+    environment:
+      DATABASE_URL: postgresql://shipwatch:shipwatch@db-local:5432/shipwatch
+      PHOTO_DIR: /data/photos
+      WATER_ROI: 0,0.35,1,1
+      CONFIDENCE_THRESHOLD: "0.35"
+      NMS_THRESHOLD: "0.45"
+      DETECTION_MODE: yolo
+      YOLO_MODEL: /models/yolov5n.onnx
+      MIN_TRACK_FRAMES: "4"
+      MIN_TRACK_DISPLACEMENT: "60"
+      TRACK_TTL_SECONDS: "15"
+      REGISTERED_TRACK_TTL_SECONDS: "45"
+      CAPTURE_ORIGINS: http://localhost:3003,http://127.0.0.1:3003,http://localhost:3000,http://127.0.0.1:3000
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./data/photos:/data/photos
+    depends_on:
+      - db-local
+
+volumes:
+  shipwatch-db:

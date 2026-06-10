@@ -1,0 +1,10 @@
+node_modules
+.next
+.netlify
+.env*
+*.tsbuildinfo
+coverage
+docker
+data
+detector
+supabase
