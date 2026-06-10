@@ -1,4 +1,5 @@
 import { AppShell } from "@/components/app-shell";
+import { CameraImage, CameraPlaceholder } from "@/components/camera-frame";
 import { LiveStatusBadge } from "@/components/live-status-badge";
 import { PassageGrid } from "@/components/passage-grid";
 import { StatCard } from "@/components/stat-card";
@@ -51,16 +52,17 @@ export default async function Home() {
           </div>
           {snapshotUrl ? (
             <div className="relative mt-3">
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={snapshotUrl} alt="Laatste live snapshot van het IJ" className="aspect-video w-full rounded-md object-cover" />
+              <CameraImage
+                src={snapshotUrl}
+                alt="Laatste live snapshot van het IJ"
+                frameClassName="rounded-md"
+              />
               <div className="pointer-events-none absolute bottom-2 left-2">
                 <LiveStatusBadge isLive={isLive} className="shadow-md ring-1 ring-black/10" />
               </div>
             </div>
           ) : (
-            <div className="mt-3 flex aspect-video items-center justify-center rounded-md bg-slate-100 text-sm text-slate-500">
-              Nog geen live snapshot beschikbaar
-            </div>
+            <CameraPlaceholder className="mt-3 rounded-md">Nog geen live snapshot beschikbaar</CameraPlaceholder>
           )}
         </aside>
       </section>

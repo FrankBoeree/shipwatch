@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Camera, CircleStop, ShipWheel, Upload } from "lucide-react";
+import { CameraFrame } from "@/components/camera-frame";
+import { CAMERA_FRAME_HEIGHT, CAMERA_FRAME_WIDTH } from "@/lib/camera";
 
 type Bbox = [number, number, number, number];
 
@@ -42,7 +44,7 @@ function mapBboxToDisplay(
   destWidth: number,
   destHeight: number,
 ): Bbox {
-  const scale = Math.max(destWidth / sourceWidth, destHeight / sourceHeight);
+  const scale = Math.min(destWidth / sourceWidth, destHeight / sourceHeight);
   const scaledWidth = sourceWidth * scale;
   const scaledHeight = sourceHeight * scale;
   const offsetX = (destWidth - scaledWidth) / 2;
@@ -379,7 +381,11 @@ export function CaptureClient() {
 
     async function start() {
       stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: {
+          facingMode: "environment",
+          width: { ideal: CAMERA_FRAME_WIDTH },
+          height: { ideal: CAMERA_FRAME_HEIGHT },
+        },
         audio: false,
       });
 
@@ -415,11 +421,14 @@ export function CaptureClient() {
 
   return (
     <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_340px]">
-      <section ref={previewRef} className="relative aspect-video overflow-hidden rounded-lg border border-slate-200 bg-slate-950">
-        <video ref={videoRef} playsInline muted className="absolute inset-0 h-full w-full bg-slate-950 object-cover" />
+      <CameraFrame
+        ref={previewRef}
+        className="rounded-lg border border-slate-200"
+      >
+        <video ref={videoRef} playsInline muted className="absolute inset-0 h-full w-full bg-slate-950 object-contain" />
         <canvas ref={overlayRef} className="pointer-events-none absolute inset-0 h-full w-full" aria-hidden="true" />
         <canvas ref={canvasRef} className="hidden" />
-      </section>
+      </CameraFrame>
       <aside className="rounded-lg border border-slate-200 bg-white p-5">
         <div className="mb-5">
           <p className="mb-2 text-sm font-medium text-slate-500">Detector</p>

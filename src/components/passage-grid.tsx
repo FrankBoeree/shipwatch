@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { CameraFrame } from "@/components/camera-frame";
 import type { Passage } from "@/lib/types";
 import { formatDateTime, formatPercent, labelDirection, labelShipType } from "@/lib/format";
 
@@ -11,18 +12,18 @@ export function PassageGrid({ passages }: { passages: Passage[] }) {
           href={`/passages/${passage.id}`}
           className="overflow-hidden rounded-lg border border-slate-200 bg-white hover:border-cyan-700"
         >
-          <div className="aspect-[16/9] bg-slate-100">
+          <CameraFrame className="bg-slate-100">
             {passage.photoUrl ? (
               // eslint-disable-next-line @next/next/no-img-element
               <img
                 src={passage.photoUrl}
                 alt={`Passagefoto van ${passage.shipName ?? "onbekend schip"}`}
-                className="h-full w-full object-cover"
+                className="absolute inset-0 h-full w-full object-contain"
               />
             ) : (
-              <div className="flex h-full w-full items-center justify-center text-sm text-slate-500">Geen foto beschikbaar</div>
+              <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-500">Geen foto beschikbaar</div>
             )}
-          </div>
+          </CameraFrame>
           <div className="p-4">
             <div className="flex items-start justify-between gap-3">
               <div>

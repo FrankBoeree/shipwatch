@@ -23,7 +23,7 @@ export function PassageTable({ passages }: { passages: Passage[] }) {
               <td className="w-28 px-4 py-3">
                 <Link
                   href={`/passages/${passage.id}`}
-                  className="block h-16 w-24 overflow-hidden rounded-md bg-slate-100 ring-1 ring-slate-200"
+                  className="block w-24 overflow-hidden rounded-md bg-slate-100 ring-1 ring-slate-200 aspect-camera"
                   aria-label={`Bekijk passagefoto van ${passage.shipName ?? "onbekend schip"}`}
                 >
                   {passage.photoUrl ? (
@@ -31,7 +31,7 @@ export function PassageTable({ passages }: { passages: Passage[] }) {
                     <img
                       src={passage.photoUrl}
                       alt={`Passagefoto van ${passage.shipName ?? "onbekend schip"}`}
-                      className="h-full w-full object-cover"
+                      className="h-full w-full object-contain"
                     />
                   ) : (
                     <span className="flex h-full w-full items-center justify-center px-2 text-center text-[11px] leading-tight text-slate-500">

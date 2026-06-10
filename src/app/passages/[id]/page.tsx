@@ -1,5 +1,6 @@
 import { notFound } from "next/navigation";
 import { AppShell } from "@/components/app-shell";
+import { CameraImage, CameraPlaceholder } from "@/components/camera-frame";
 import { getPassage } from "@/lib/db";
 import { formatDateTime, formatPercent, labelDirection, labelShipType } from "@/lib/format";
 export const revalidate = 15;
@@ -21,12 +22,9 @@ export default async function PassageDetailPage({ params }: { params: Promise<{ 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
         <section className="rounded-lg border border-slate-200 bg-white p-4">
           {passage.photoUrl ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={passage.photoUrl} alt="Passagefoto" className="aspect-video w-full rounded-md object-cover" />
+            <CameraImage src={passage.photoUrl} alt="Passagefoto" frameClassName="rounded-md" />
           ) : (
-            <div className="flex aspect-video items-center justify-center rounded-md bg-slate-100 text-sm text-slate-500">
-              Geen foto beschikbaar in demo-data
-            </div>
+            <CameraPlaceholder className="rounded-md">Geen foto beschikbaar in demo-data</CameraPlaceholder>
           )}
         </section>
         <aside className="rounded-lg border border-slate-200 bg-white p-5">
