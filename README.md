@@ -52,9 +52,15 @@ Voor echte scheepsdetectie start Docker ook `detector-yolo` op poort `8001`. Dez
 - `MOTION_MIN_AREA`: minimale bewegingscontour voor lokale motion-mode, standaard in Compose `1000`.
 - `TRACK_TTL_SECONDS`: hoe lang een track zonder nieuwe detectie mag blijven bestaan, standaard in Compose `15`.
 - `REGISTERED_TRACK_TTL_SECONDS`: hoe lang een al vastgelegde track detecties blijft absorberen, standaard in Compose `45`. Dit voorkomt dat hetzelfde schip tijdens dezelfde passage opnieuw wordt vastgelegd.
+- `MIN_CENTER_SCORE`: minimale centreringsscore (0-1) voordat een passage wordt gelogd. De detector wacht tot het schip in het midden van het beeld staat en maakt dan één screenshot van het best gecentreerde frame.
+- `CENTER_ZONE_X` / `CENTER_ZONE_Y`: genormaliseerde zone waarin het schip moet staan, standaard `0.2,0.8` horizontaal en `0.35,0.85` verticaal.
+- `PASSAGE_COOLDOWN_SECONDS`: extra cooldown na registratie om dubbele passages van hetzelfde schip te voorkomen, standaard `90`.
+- `PASSAGE_COOLDOWN_X_DISTANCE`: maximale horizontale afstand in pixels tussen twee passages binnen de cooldown om ze als hetzelfde schip te zien, standaard `200`.
 - `DETECTION_MODE`: `motion` voor debug, `yolo` voor echte scheepsdetectie.
 - `REGISTER_MOTION_PASSAGES`: standaard `false`; alleen op `true` zetten voor technische tests, want beweging is geen scheepsherkenning.
 - `YOLO_MODEL`: ONNX modelpad wanneer `DETECTION_MODE=yolo` gebruikt wordt.
+
+Na detectie classificeert de detector het schip met eenvoudige bbox-heuristieken in `pleasure_craft` (zeil-/pleziervaart), `cargo` of `other`. Drempels zijn instelbaar via `CARGO_MIN_WIDTH_RATIO`, `CARGO_MIN_AREA_RATIO`, `SMALL_MAX_WIDTH_RATIO` en `SAIL_MAX_ASPECT_RATIO`.
 
 ## MVP-grenzen
 

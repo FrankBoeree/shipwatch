@@ -24,10 +24,21 @@ TRACK_MAX_DISTANCE = float(os.getenv("TRACK_MAX_DISTANCE", "120"))
 TRACK_TTL_SECONDS = float(os.getenv("TRACK_TTL_SECONDS", "4"))
 REGISTERED_TRACK_TTL_SECONDS = float(os.getenv("REGISTERED_TRACK_TTL_SECONDS", "45"))
 MIN_TRACK_DISPLACEMENT = float(os.getenv("MIN_TRACK_DISPLACEMENT", "60"))
+MIN_CENTER_SCORE = float(os.getenv("MIN_CENTER_SCORE", "0.55"))
+CENTER_ZONE_X = os.getenv("CENTER_ZONE_X", "0.2,0.8")
+CENTER_ZONE_Y = os.getenv("CENTER_ZONE_Y", "0.35,0.85")
+PASSAGE_COOLDOWN_SECONDS = float(os.getenv("PASSAGE_COOLDOWN_SECONDS", "90"))
+PASSAGE_COOLDOWN_X_DISTANCE = float(os.getenv("PASSAGE_COOLDOWN_X_DISTANCE", "200"))
+TRACK_MATCH_MIN_SCORE = float(os.getenv("TRACK_MATCH_MIN_SCORE", "0.25"))
 DETECTION_MODE = os.getenv("DETECTION_MODE", "yolo")
 SHIP_CLASS_NAMES = {"boat", "ship"}
 MOTION_MIN_AREA = int(os.getenv("MOTION_MIN_AREA", "4500"))
 REGISTER_MOTION_PASSAGES = os.getenv("REGISTER_MOTION_PASSAGES", "false").lower() == "true"
+CARGO_MIN_WIDTH_RATIO = float(os.getenv("CARGO_MIN_WIDTH_RATIO", "0.22"))
+CARGO_MIN_AREA_RATIO = float(os.getenv("CARGO_MIN_AREA_RATIO", "0.055"))
+SMALL_MAX_WIDTH_RATIO = float(os.getenv("SMALL_MAX_WIDTH_RATIO", "0.12"))
+SAIL_MAX_ASPECT_RATIO = float(os.getenv("SAIL_MAX_ASPECT_RATIO", "0.95"))
+SHIP_TYPES = ("pleasure_craft", "cargo", "other", "unknown")
 
 PHOTO_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -55,12 +66,22 @@ class Track:
     last_seen: float
     points: list[tuple[float, float]] = field(default_factory=list)
     best_confidence: float = 0
+    best_center_score: float = 0
     best_frame: np.ndarray | None = None
     best_bbox: tuple[int, int, int, int] | None = None
+    last_bbox: tuple[int, int, int, int] | None = None
     registered: bool = False
 
 
+@dataclass
+class RecentPassage:
+    registered_at: float
+    direction: str
+    exit_x: float
+
+
 tracks: dict[str, Track] = {}
+recent_passages: list[RecentPassage] = []
 backgrounds: dict[str, np.ndarray] = {}
 model: cv2.dnn.Net | None = None
 
@@ -222,6 +243,135 @@ def centroid(bbox: tuple[int, int, int, int]) -> tuple[float, float]:
     return ((x1 + x2) / 2, (y1 + y2) / 2)
 
 
+def parse_zone(raw: str) -> tuple[float, float]:
+    left, right = [float(part) for part in raw.split(",")]
+    return left, right
+
+
+CENTER_X_MIN, CENTER_X_MAX = parse_zone(CENTER_ZONE_X)
+CENTER_Y_MIN, CENTER_Y_MAX = parse_zone(CENTER_ZONE_Y)
+
+
+def bbox_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+        return 0.0
+
+    inter_area = float((inter_x2 - inter_x1) * (inter_y2 - inter_y1))
+    area_a = float(max(1, ax2 - ax1) * max(1, ay2 - ay1))
+    area_b = float(max(1, bx2 - bx1) * max(1, by2 - by1))
+    return inter_area / (area_a + area_b - inter_area)
+
+
+def center_score(cx: float, cy: float, width: int, height: int) -> float:
+    if width <= 0 or height <= 0:
+        return 0.0
+
+    norm_x = cx / width
+    norm_y = cy / height
+    x_score = 0.0
+    y_score = 0.0
+
+    if CENTER_X_MIN <= norm_x <= CENTER_X_MAX:
+        center_x = (CENTER_X_MIN + CENTER_X_MAX) / 2
+        half_span = max((CENTER_X_MAX - CENTER_X_MIN) / 2, 0.01)
+        x_score = max(0.0, 1.0 - abs(norm_x - center_x) / half_span)
+
+    if CENTER_Y_MIN <= norm_y <= CENTER_Y_MAX:
+        center_y = (CENTER_Y_MIN + CENTER_Y_MAX) / 2
+        half_span = max((CENTER_Y_MAX - CENTER_Y_MIN) / 2, 0.01)
+        y_score = max(0.0, 1.0 - abs(norm_y - center_y) / half_span)
+
+    return min(x_score, y_score)
+
+
+def predicted_centroid(track: Track) -> tuple[float, float]:
+    if len(track.points) >= 2:
+        px, py = track.points[-2]
+        cx, cy = track.points[-1]
+        return (cx + (cx - px), cy + (cy - py))
+    return track.points[-1]
+
+
+def track_match_score(track: Track, detection: Detection, width: int, height: int) -> float:
+    if not track.points:
+        return 0.0
+
+    cx, cy = centroid(detection.bbox)
+    px, py = predicted_centroid(track)
+    distance = float(np.hypot(cx - px, cy - py))
+    distance_score = max(0.0, 1.0 - distance / TRACK_MAX_DISTANCE)
+
+    iou_score = bbox_iou(track.last_bbox, detection.bbox) if track.last_bbox else 0.0
+    combined = (distance_score * 0.45) + (iou_score * 0.55)
+
+    if track.registered:
+        combined += 0.2
+
+    return combined
+
+
+def prune_recent_passages(now: float) -> None:
+    global recent_passages
+    recent_passages = [
+        item for item in recent_passages if now - item.registered_at <= PASSAGE_COOLDOWN_SECONDS
+    ]
+
+
+def is_duplicate_passage(track: Track) -> bool:
+    now = time.time()
+    prune_recent_passages(now)
+    direction = direction_for(track)
+    exit_x = track.points[-1][0]
+
+    for item in recent_passages:
+        if item.direction != direction:
+            continue
+        if abs(exit_x - item.exit_x) <= PASSAGE_COOLDOWN_X_DISTANCE:
+            return True
+
+    return False
+
+
+def remember_passage(track: Track) -> None:
+    recent_passages.append(
+        RecentPassage(
+            registered_at=time.time(),
+            direction=direction_for(track),
+            exit_x=track.points[-1][0],
+        )
+    )
+
+
+def classify_ship_type(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> str:
+    """Classify a detected vessel using simple bbox heuristics relative to the frame."""
+    frame_height, frame_width = frame.shape[:2]
+    if frame_width <= 0 or frame_height <= 0:
+        return "unknown"
+
+    x1, y1, x2, y2 = bbox
+    box_width = max(1, x2 - x1)
+    box_height = max(1, y2 - y1)
+
+    width_ratio = box_width / frame_width
+    area_ratio = (box_width * box_height) / (frame_width * frame_height)
+    aspect_ratio = box_width / box_height
+
+    if width_ratio >= CARGO_MIN_WIDTH_RATIO or area_ratio >= CARGO_MIN_AREA_RATIO:
+        return "cargo"
+
+    if width_ratio < SMALL_MAX_WIDTH_RATIO or aspect_ratio <= SAIL_MAX_ASPECT_RATIO:
+        return "pleasure_craft"
+
+    return "other"
+
+
 def update_tracks(camera_id: str, detections: list[Detection], frame: np.ndarray) -> list[Track]:
     now = time.time()
     expired = [
@@ -232,31 +382,42 @@ def update_tracks(camera_id: str, detections: list[Detection], frame: np.ndarray
     for track_id in expired:
         del tracks[track_id]
 
+    height, width = frame.shape[:2]
     changed: list[Track] = []
+    matched_track_ids: set[str] = set()
+    ordered_detections = sorted(detections, key=lambda item: item.confidence, reverse=True)
 
-    for detection in detections:
+    for detection in ordered_detections:
         cx, cy = centroid(detection.bbox)
         best_track: Track | None = None
-        best_distance = TRACK_MAX_DISTANCE
+        best_score = TRACK_MATCH_MIN_SCORE
 
         for track in tracks.values():
-            if track.camera_id != camera_id or not track.points:
+            if track.camera_id != camera_id or track.id in matched_track_ids or not track.points:
                 continue
-            px, py = track.points[-1]
-            distance = float(np.hypot(cx - px, cy - py))
-            if distance < best_distance:
-                best_distance = distance
+
+            score = track_match_score(track, detection, width, height)
+            if score > best_score:
+                best_score = score
                 best_track = track
 
         if best_track is None:
             best_track = Track(id=str(uuid.uuid4()), camera_id=camera_id, first_seen=now, last_seen=now)
             tracks[best_track.id] = best_track
 
+        matched_track_ids.add(best_track.id)
         best_track.points.append((cx, cy))
         best_track.last_seen = now
+        best_track.last_bbox = detection.bbox
 
-        if detection.confidence >= best_track.best_confidence:
-            best_track.best_confidence = detection.confidence
+        frame_center_score = center_score(cx, cy, width, height)
+        best_track.best_confidence = max(best_track.best_confidence, detection.confidence)
+
+        if frame_center_score > best_track.best_center_score or (
+            frame_center_score == best_track.best_center_score
+            and detection.confidence >= best_track.best_confidence
+        ):
+            best_track.best_center_score = frame_center_score
             best_track.best_bbox = detection.bbox
             best_track.best_frame = frame.copy()
 
@@ -292,10 +453,56 @@ def debug_tracks_for(camera_id: str) -> list[dict[str, Any]]:
             "registered": track.registered,
             "direction": direction_for(track),
             "displacement": round(displacement_for(track), 1),
+            "centerScore": round(track.best_center_score, 3),
         }
         for track in tracks.values()
         if track.camera_id == camera_id
     ]
+
+
+def track_ready_for_registration(track: Track) -> bool:
+    if track.registered or len(track.points) < MIN_TRACK_FRAMES:
+        return False
+
+    if displacement_for(track) < MIN_TRACK_DISPLACEMENT:
+        return False
+
+    if direction_for(track) == "unknown":
+        return False
+
+    return track.best_center_score >= MIN_CENTER_SCORE
+
+
+def pick_registration_candidate(camera_id: str) -> Track | None:
+    candidates = [
+        track
+        for track in tracks.values()
+        if track.camera_id == camera_id and track_ready_for_registration(track)
+    ]
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda track: (track.best_center_score, track.best_confidence))
+
+
+def register_track(track: Track) -> dict[str, Any]:
+    passage_id = str(uuid.uuid4())
+    detected_type = detected_type_for(track)
+    photo_path = save_photo(track, passage_id)
+    insert_passage(passage_id, track, photo_path, detected_type)
+    track.registered = True
+    remember_passage(track)
+
+    return {
+        "id": passage_id,
+        "direction": direction_for(track),
+        "confidence": round(track.best_confidence, 4),
+        "detectedType": detected_type,
+        "photoPath": photo_path,
+        "bbox": list(track.best_bbox) if track.best_bbox else None,
+        "centerScore": round(track.best_center_score, 4),
+    }
 
 
 def draw_ship_bbox(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> None:
@@ -319,7 +526,13 @@ def save_photo(track: Track, passage_id: str) -> str | None:
     return str(photo_path)
 
 
-def insert_passage(passage_id: str, track: Track, photo_path: str | None) -> None:
+def detected_type_for(track: Track) -> str:
+    if track.best_frame is None or track.best_bbox is None:
+        return "unknown"
+    return classify_ship_type(track.best_frame, track.best_bbox)
+
+
+def insert_passage(passage_id: str, track: Track, photo_path: str | None, detected_type: str) -> None:
     if not DATABASE_URL:
         return
 
@@ -332,10 +545,10 @@ def insert_passage(passage_id: str, track: Track, photo_path: str | None) -> Non
                   id, occurred_at, direction, detection_confidence,
                   detected_type, identification_status, photo_url, created_at
                 )
-                values (%s, now(), %s, %s, 'unknown', 'unknown', %s, now())
+                values (%s, now(), %s, %s, %s, 'unknown', %s, now())
                 on conflict (id) do nothing
                 """,
-                (passage_id, direction_for(track), track.best_confidence, photo_path),
+                (passage_id, direction_for(track), track.best_confidence, detected_type, photo_path),
             )
             cur.execute(
                 """
@@ -364,6 +577,12 @@ def health():
         "minTrackDisplacement": MIN_TRACK_DISPLACEMENT,
         "trackTtlSeconds": TRACK_TTL_SECONDS,
         "registeredTrackTtlSeconds": REGISTERED_TRACK_TTL_SECONDS,
+        "minCenterScore": MIN_CENTER_SCORE,
+        "centerZoneX": [CENTER_X_MIN, CENTER_X_MAX],
+        "centerZoneY": [CENTER_Y_MIN, CENTER_Y_MAX],
+        "passageCooldownSeconds": PASSAGE_COOLDOWN_SECONDS,
+        "shipTypeClassification": "heuristic",
+        "shipTypes": list(SHIP_TYPES),
     }
 
 
@@ -372,33 +591,21 @@ async def detect_frame(frame: UploadFile = File(...), cameraId: str = Form("loca
     contents = await frame.read()
     image = decode_frame(contents)
     detections = detect_motion(cameraId, image) if DETECTION_MODE == "motion" else detect_ships(image)
-    changed_tracks = update_tracks(cameraId, detections, image)
+    update_tracks(cameraId, detections, image)
     passage = None
     registration_enabled = DETECTION_MODE == "yolo" or REGISTER_MOTION_PASSAGES
 
-    for track in changed_tracks:
-        if track.registered or len(track.points) < MIN_TRACK_FRAMES:
-            continue
-
-        if not registration_enabled:
-            track.registered = True
-            continue
-
-        if displacement_for(track) < MIN_TRACK_DISPLACEMENT or direction_for(track) == "unknown":
-            continue
-
-        passage_id = str(uuid.uuid4())
-        photo_path = save_photo(track, passage_id)
-        insert_passage(passage_id, track, photo_path)
-        track.registered = True
-        passage = {
-            "id": passage_id,
-            "direction": direction_for(track),
-            "confidence": round(track.best_confidence, 4),
-            "photoPath": photo_path,
-            "bbox": list(track.best_bbox) if track.best_bbox else None,
-        }
-        break
+    if not registration_enabled:
+        for track in tracks.values():
+            if track.camera_id == cameraId and not track.registered and len(track.points) >= MIN_TRACK_FRAMES:
+                track.registered = True
+    else:
+        candidate = pick_registration_candidate(cameraId)
+        if candidate is not None:
+            if is_duplicate_passage(candidate):
+                candidate.registered = True
+            else:
+                passage = register_track(candidate)
 
     return {
         "cameraId": cameraId,

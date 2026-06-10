@@ -7,7 +7,14 @@ type Bbox = [number, number, number, number];
 
 type DetectionResponse = {
   detections?: Array<{ label: string; confidence: number; bbox: Bbox }>;
-  passage?: { id: string; direction: string; confidence: number; photoPath?: string | null; bbox?: Bbox | null } | null;
+  passage?: {
+    id: string;
+    direction: string;
+    confidence: number;
+    detectedType?: string;
+    photoPath?: string | null;
+    bbox?: Bbox | null;
+  } | null;
   registrationEnabled?: boolean;
   registrationMode?: string;
   error?: string;
@@ -145,6 +152,7 @@ export function CaptureClient() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
   const previewRef = useRef<HTMLDivElement | null>(null);
+  const syncedPassageIdsRef = useRef<Set<string>>(new Set());
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState("Camera niet actief");
   const [liveDetections, setLiveDetections] = useState<DetectionResponse["detections"]>([]);
@@ -202,7 +210,7 @@ export function CaptureClient() {
         occurredAt: new Date().toISOString(),
         direction: passage.direction,
         detectionConfidence: passage.confidence,
-        detectedType: "unknown",
+        detectedType: passage.detectedType ?? "unknown",
         identificationStatus: "unknown",
         photoUrl: null,
       }),
@@ -232,7 +240,11 @@ export function CaptureClient() {
       }
     }
 
-    setStatus(`Passage gesynchroniseerd: ${passage.id}`);
+    setStatus(
+      passage.detectedType
+        ? `Passage gesynchroniseerd: ${passage.id} (${passage.detectedType})`
+        : `Passage gesynchroniseerd: ${passage.id}`,
+    );
   }, [syncToken, syncUrl]);
 
   const sendFrame = useCallback(async (syncSnapshot: boolean) => {
@@ -256,7 +268,8 @@ export function CaptureClient() {
         setStatus(payload.error ?? "Detector gaf een fout terug");
       }
 
-      if (payload.passage) {
+      if (payload.passage && !syncedPassageIdsRef.current.has(payload.passage.id)) {
+        syncedPassageIdsRef.current.add(payload.passage.id);
         const bbox = pickPassageBbox(payload.passage, payload.detections);
         const photoBlob = bbox ? await annotatePhotoBlob(blob, bbox) : blob;
         await syncPassage(payload.passage, photoBlob);
@@ -350,6 +363,7 @@ export function CaptureClient() {
   useEffect(() => {
     if (!running) {
       setLiveDetections([]);
+      syncedPassageIdsRef.current.clear();
     }
   }, [running]);
 
