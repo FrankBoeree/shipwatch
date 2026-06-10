@@ -40,6 +40,9 @@ yarn-error.log*
 # netlify
 .netlify
 
+# local detector storage (photos sync to Supabase in production)
+/data/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
