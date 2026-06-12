@@ -10,6 +10,7 @@ const passageSchema = z.object({
   detectedType: z
     .enum([
       "pleasure_craft",
+      "sailboat",
       "cargo",
       "container",
       "tanker",

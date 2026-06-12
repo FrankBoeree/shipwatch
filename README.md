@@ -47,20 +47,26 @@ Voor echte scheepsdetectie start Docker ook `detector-yolo` op poort `8001`. Dez
 
 - `WATER_ROI`: genormaliseerde waterzone, standaard `0,0.35,1,1`.
 - `CONFIDENCE_THRESHOLD`: standaard `0.45`.
-- `MIN_TRACK_FRAMES`: aantal frames voordat een passage telt.
+- `MIN_TRACK_FRAMES`: aantal frames voordat een passage telt, standaard `3`.
+- `FALLBACK_MIN_TRACK_FRAMES`: minimumaantal frames voor het vangnet, standaard `2`. Tracks die uit beeld verdwijnen zonder aan de normale criteria te voldoen (snelle schepen, schepen die nooit volledig in beeld waren) worden bij verloop alsnog één keer geregistreerd.
 - `MIN_TRACK_DISPLACEMENT`: minimale verplaatsing in pixels voordat een track als passage telt. Dit voorkomt registratie van statische objecten, zoals gebouwen of kade-objecten, die per ongeluk als `boat` worden herkend.
 - `MOTION_MIN_AREA`: minimale bewegingscontour voor lokale motion-mode, standaard in Compose `1000`.
 - `TRACK_TTL_SECONDS`: hoe lang een track zonder nieuwe detectie mag blijven bestaan, standaard in Compose `15`.
 - `REGISTERED_TRACK_TTL_SECONDS`: hoe lang een al vastgelegde track detecties blijft absorberen, standaard in Compose `45`. Dit voorkomt dat hetzelfde schip tijdens dezelfde passage opnieuw wordt vastgelegd.
-- `MIN_CENTER_SCORE`: voorkeursscore voor centrering (0-1). Gecentreerde schepen worden eerder gelogd, maar bewegende schepen die niet in het midden komen worden ook vastgelegd.
+- `EDGE_MARGIN_RATIO`: marge tot de beeldranden (fractie van framegrootte, standaard `0.015`) waarbinnen een schip als volledig in beeld telt. De passagefoto wordt alleen gekozen uit frames waarin het schip volledig in beeld is.
+- `VELOCITY_WINDOW`: aantal recente trackpunten waarover de snelheid wordt gemiddeld, standaard `6`. Omdat schepen een redelijk vaste snelheid varen, wordt deze snelheid gebruikt om posities te voorspellen bij gemiste detecties en om duplicaten te herkennen.
 - `CENTER_ZONE_X` / `CENTER_ZONE_Y`: zone waarvoor centrering een bonus geeft bij framekeuze, standaard `0.1,0.9` horizontaal en `0.35,0.95` verticaal.
-- `PASSAGE_COOLDOWN_SECONDS`: cooldown na registratie om dubbele passages van hetzelfde schip te voorkomen, standaard `60`.
-- `PASSAGE_COOLDOWN_X_DISTANCE`: maximale afstand in pixels tussen start- én eindpositie om twee passages als hetzelfde schip te zien, standaard `80`.
+- `PASSAGE_COOLDOWN_SECONDS`: hoe lang recente passages onthouden worden voor duplicaatdetectie, standaard `60`.
+- `PASSAGE_DUPLICATE_DISTANCE`: maximale afstand in pixels tussen een nieuwe track en de (op constante snelheid) voorspelde positie van een recente passage om als duplicaat te tellen, standaard `130`.
 - `DETECTION_MODE`: `motion` voor debug, `yolo` voor echte scheepsdetectie.
 - `REGISTER_MOTION_PASSAGES`: standaard `false`; alleen op `true` zetten voor technische tests, want beweging is geen scheepsherkenning.
 - `YOLO_MODEL`: ONNX modelpad wanneer `DETECTION_MODE=yolo` gebruikt wordt.
 
-Na detectie classificeert de detector het schip met eenvoudige bbox-heuristieken in `pleasure_craft` (zeil-/pleziervaart), `cargo` of `other`. Drempels zijn instelbaar via `CARGO_MIN_WIDTH_RATIO`, `CARGO_MIN_AREA_RATIO`, `SMALL_MAX_WIDTH_RATIO` en `SAIL_MAX_ASPECT_RATIO`.
+Na detectie classificeert de detector het schip op basis van de mediane aspectratio (breedte/hoogte van de bounding box) over alle frames waarin het schip volledig in beeld was:
+
+- `cargo` (vrachtschip): heel langgerekt, aspectratio ≥ `CARGO_MIN_ASPECT_RATIO` (standaard `3.0`).
+- `sailboat` (zeilboot): hoger dan lang door de mast, aspectratio ≤ `SAILBOAT_MAX_ASPECT_RATIO` (standaard `0.9`).
+- `other`: alles daartussenin.
 
 ## MVP-grenzen
 

@@ -16,8 +16,22 @@ type PassagePayload = {
   confidence: number;
   detectedType?: string;
   photoPath?: string | null;
+  photoData?: string | null;
   bbox?: Bbox | null;
 };
+
+function photoBlobFromBase64(data: string): Blob | null {
+  try {
+    const binary = atob(data);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new Blob([bytes], { type: "image/jpeg" });
+  } catch {
+    return null;
+  }
+}
 
 type DetectionResponse = {
   detections?: Array<{ label: string; confidence: number; bbox: Bbox }>;
@@ -316,7 +330,11 @@ export function CaptureClient() {
         const frameWidth = videoRef.current?.videoWidth ?? 0;
         const frameHeight = videoRef.current?.videoHeight ?? 0;
         const detectedType = resolveDetectedType(passage, bbox, frameWidth, frameHeight);
-        const photoBlob = bbox ? await annotatePhotoBlob(blob, bbox, detectedType) : blob;
+        // Prefer the detector's photo: that is the best frame in which the
+        // ship was fully in view (already annotated with bbox and type).
+        const detectorPhoto = passage.photoData ? photoBlobFromBase64(passage.photoData) : null;
+        const photoBlob =
+          detectorPhoto ?? (bbox ? await annotatePhotoBlob(blob, bbox, detectedType) : blob);
         await syncPassage({ ...passage, detectedType }, photoBlob);
       }
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import os
+import statistics
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -19,30 +21,41 @@ PHOTO_DIR = Path(os.getenv("PHOTO_DIR", "/data/photos"))
 MODEL_PATH = os.getenv("YOLO_MODEL", "/models/yolov5n.onnx")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.45"))
 NMS_THRESHOLD = float(os.getenv("NMS_THRESHOLD", "0.45"))
-MIN_TRACK_FRAMES = int(os.getenv("MIN_TRACK_FRAMES", "4"))
+MIN_TRACK_FRAMES = int(os.getenv("MIN_TRACK_FRAMES", "3"))
+# Tracks that leave the frame before meeting the normal criteria still register
+# once they have at least this many observations (fast ships, partial views).
+FALLBACK_MIN_TRACK_FRAMES = int(os.getenv("FALLBACK_MIN_TRACK_FRAMES", "2"))
 TRACK_MAX_DISTANCE = float(os.getenv("TRACK_MAX_DISTANCE", "150"))
 TRACK_TTL_SECONDS = float(os.getenv("TRACK_TTL_SECONDS", "4"))
 REGISTERED_TRACK_TTL_SECONDS = float(os.getenv("REGISTERED_TRACK_TTL_SECONDS", "45"))
 MIN_TRACK_DISPLACEMENT = float(os.getenv("MIN_TRACK_DISPLACEMENT", "45"))
-MIN_CENTER_SCORE = float(os.getenv("MIN_CENTER_SCORE", "0.2"))
 CENTER_ZONE_X = os.getenv("CENTER_ZONE_X", "0.1,0.9")
 CENTER_ZONE_Y = os.getenv("CENTER_ZONE_Y", "0.35,0.95")
 PASSAGE_COOLDOWN_SECONDS = float(os.getenv("PASSAGE_COOLDOWN_SECONDS", "60"))
-PASSAGE_COOLDOWN_X_DISTANCE = float(os.getenv("PASSAGE_COOLDOWN_X_DISTANCE", "80"))
-PASSAGE_COOLDOWN_Y_DISTANCE = float(os.getenv("PASSAGE_COOLDOWN_Y_DISTANCE", "70"))
+# Max distance between a candidate track and the constant-velocity prediction of
+# a recently registered passage before the candidate counts as a duplicate.
+PASSAGE_DUPLICATE_DISTANCE = float(os.getenv("PASSAGE_DUPLICATE_DISTANCE", "130"))
 TRACK_MATCH_MIN_SCORE = float(os.getenv("TRACK_MATCH_MIN_SCORE", "0.15"))
+# Number of recent track points used to estimate velocity (ships move at a
+# fairly constant speed, so an average over several points is robust to noise).
+VELOCITY_WINDOW = int(os.getenv("VELOCITY_WINDOW", "6"))
+# A ship counts as fully visible when its bbox stays this fraction of the frame
+# size away from every frame edge.
+EDGE_MARGIN_RATIO = float(os.getenv("EDGE_MARGIN_RATIO", "0.015"))
 DETECTION_MODE = os.getenv("DETECTION_MODE", "yolo")
 SHIP_CLASS_NAMES = {"boat", "ship"}
 MOTION_MIN_AREA = int(os.getenv("MOTION_MIN_AREA", "4500"))
 REGISTER_MOTION_PASSAGES = os.getenv("REGISTER_MOTION_PASSAGES", "false").lower() == "true"
-CARGO_MIN_WIDTH_RATIO = float(os.getenv("CARGO_MIN_WIDTH_RATIO", "0.22"))
-CARGO_MIN_AREA_RATIO = float(os.getenv("CARGO_MIN_AREA_RATIO", "0.055"))
-SMALL_MAX_WIDTH_RATIO = float(os.getenv("SMALL_MAX_WIDTH_RATIO", "0.12"))
-SAIL_MAX_ASPECT_RATIO = float(os.getenv("SAIL_MAX_ASPECT_RATIO", "0.95"))
-SHIP_TYPES = ("pleasure_craft", "cargo", "other", "unknown")
+# Cargo ships are far longer than they are high; sailboats (mast) are higher
+# than they are long. Everything in between stays "other".
+CARGO_MIN_ASPECT_RATIO = float(os.getenv("CARGO_MIN_ASPECT_RATIO", "3.0"))
+SAILBOAT_MAX_ASPECT_RATIO = float(os.getenv("SAILBOAT_MAX_ASPECT_RATIO", "0.9"))
+PHOTO_JPEG_QUALITY = int(os.getenv("PHOTO_JPEG_QUALITY", "82"))
+SHIP_TYPES = ("cargo", "sailboat", "other", "unknown")
 SHIP_TYPE_LABELS = {
-    "pleasure_craft": "Pleziervaart",
     "cargo": "Vrachtschip",
+    "sailboat": "Zeilboot",
+    "pleasure_craft": "Pleziervaart",
     "other": "Overig",
     "unknown": "Onbekend",
 }
@@ -72,11 +85,19 @@ class Track:
     first_seen: float
     last_seen: float
     points: list[tuple[float, float]] = field(default_factory=list)
+    point_times: list[float] = field(default_factory=list)
+    # Aspect ratios sampled only from fully visible bboxes (reliable shape info).
+    aspect_samples: list[float] = field(default_factory=list)
     best_confidence: float = 0
     best_center_score: float = 0
+    # Best frame in which the ship is *fully* visible.
     best_frame_quality: float = 0
     best_frame: np.ndarray | None = None
     best_bbox: tuple[int, int, int, int] | None = None
+    # Best frame overall, used as fallback when the ship is never fully visible.
+    fallback_frame_quality: float = 0
+    fallback_frame: np.ndarray | None = None
+    fallback_bbox: tuple[int, int, int, int] | None = None
     last_bbox: tuple[int, int, int, int] | None = None
     registered: bool = False
 
@@ -85,10 +106,10 @@ class Track:
 class RecentPassage:
     registered_at: float
     direction: str
-    start_x: float
     exit_x: float
-    start_y: float
     exit_y: float
+    velocity_x: float
+    velocity_y: float
 
 
 tracks: dict[str, Track] = {}
@@ -300,27 +321,70 @@ def frame_quality_score(center: float, confidence: float) -> float:
     return (center * 0.35) + (confidence * 0.65)
 
 
-def predicted_centroid(track: Track) -> tuple[float, float]:
-    if len(track.points) >= 2:
-        px, py = track.points[-2]
-        cx, cy = track.points[-1]
-        return (cx + (cx - px), cy + (cy - py))
-    return track.points[-1]
+def is_fully_visible(bbox: tuple[int, int, int, int], width: int, height: int) -> bool:
+    """True when the bbox keeps a margin to every frame edge (ship fully in view)."""
+    margin_x = max(4.0, width * EDGE_MARGIN_RATIO)
+    margin_y = max(4.0, height * EDGE_MARGIN_RATIO)
+    x1, y1, x2, y2 = bbox
+    return (
+        x1 >= margin_x
+        and y1 >= margin_y
+        and x2 <= width - margin_x
+        and y2 <= height - margin_y
+    )
 
 
-def track_match_score(track: Track, detection: Detection, width: int, height: int) -> float:
+def track_velocity(track: Track) -> tuple[float, float]:
+    """Average velocity (px/s) over the most recent points.
+
+    Ships move at a fairly constant speed, so averaging over a window gives a
+    stable estimate that survives single missed or jittery detections.
+    """
+    if len(track.points) < 2:
+        return (0.0, 0.0)
+
+    window = min(len(track.points), max(2, VELOCITY_WINDOW))
+    x0, y0 = track.points[-window]
+    t0 = track.point_times[-window]
+    x1, y1 = track.points[-1]
+    t1 = track.point_times[-1]
+    dt = t1 - t0
+
+    if dt <= 0:
+        return (0.0, 0.0)
+
+    return ((x1 - x0) / dt, (y1 - y0) / dt)
+
+
+def predicted_centroid(track: Track, at_time: float) -> tuple[float, float]:
+    cx, cy = track.points[-1]
+    vx, vy = track_velocity(track)
+    elapsed = max(0.0, at_time - track.point_times[-1])
+    return (cx + vx * elapsed, cy + vy * elapsed)
+
+
+def track_match_score(track: Track, detection: Detection, now: float) -> float:
     if not track.points:
         return 0.0
 
     cx, cy = centroid(detection.bbox)
-    px, py = predicted_centroid(track)
+    px, py = predicted_centroid(track, now)
     distance = float(np.hypot(cx - px, cy - py))
-    distance_score = max(0.0, 1.0 - distance / TRACK_MAX_DISTANCE)
+    # Allow a wider search radius after missed frames; the constant-velocity
+    # prediction keeps the expected position accurate but noise accumulates.
+    gap = max(0.0, now - track.point_times[-1])
+    allowed = TRACK_MAX_DISTANCE * (1.0 + min(gap, 3.0) * 0.4)
+    distance_score = max(0.0, 1.0 - distance / allowed)
 
     iou_score = bbox_iou(track.last_bbox, detection.bbox) if track.last_bbox else 0.0
     combined = (distance_score * 0.45) + (iou_score * 0.55)
 
-    if track.registered:
+    # Only a genuine geometric match qualifies; the registered bonus merely
+    # gives priority so re-detections stick to the registered track instead of
+    # spawning (and re-registering) a new one. A flat bonus must never push a
+    # non-matching detection past the threshold, or a new ship entering the
+    # frame would be absorbed by an old track and never recorded.
+    if combined > TRACK_MATCH_MIN_SCORE and track.registered:
         combined += 0.2
 
     return combined
@@ -334,38 +398,57 @@ def prune_recent_passages(now: float) -> None:
 
 
 def is_duplicate_passage(track: Track) -> bool:
+    """Check whether this track is the same ship as a recently registered passage.
+
+    A re-acquired track (detection dropped out and came back) starts somewhere
+    along the path of the original ship. Because ships sail at a fairly constant
+    speed, we extrapolate each recent passage with its velocity and compare the
+    candidate's first and last observation against the predicted positions.
+    """
     now = time.time()
     prune_recent_passages(now)
     direction = direction_for(track)
-    start_x, start_y = track.points[0]
-    exit_x, exit_y = track.points[-1]
 
     for item in recent_passages:
-        if item.direction != direction:
+        if (
+            direction != "unknown"
+            and item.direction != "unknown"
+            and item.direction != direction
+        ):
             continue
-        start_close = (
-            abs(start_x - item.start_x) <= PASSAGE_COOLDOWN_X_DISTANCE
-            and abs(start_y - item.start_y) <= PASSAGE_COOLDOWN_Y_DISTANCE
+
+        samples = (
+            (track.points[0], track.point_times[0]),
+            (track.points[-1], track.point_times[-1]),
         )
-        exit_close = (
-            abs(exit_x - item.exit_x) <= PASSAGE_COOLDOWN_X_DISTANCE
-            and abs(exit_y - item.exit_y) <= PASSAGE_COOLDOWN_Y_DISTANCE
-        )
-        if start_close and exit_close:
+        matches = 0
+        for (px, py), pt in samples:
+            elapsed = pt - item.registered_at
+            if elapsed < 0:
+                continue
+            pred_x = item.exit_x + item.velocity_x * elapsed
+            pred_y = item.exit_y + item.velocity_y * elapsed
+            if float(np.hypot(px - pred_x, py - pred_y)) <= PASSAGE_DUPLICATE_DISTANCE:
+                matches += 1
+
+        # Both observations must lie on the predicted trajectory, so a second
+        # ship following at a distance is not suppressed.
+        if matches == len(samples):
             return True
 
     return False
 
 
 def remember_passage(track: Track) -> None:
+    vx, vy = track_velocity(track)
     recent_passages.append(
         RecentPassage(
-            registered_at=time.time(),
+            registered_at=track.point_times[-1],
             direction=direction_for(track),
-            start_x=track.points[0][0],
             exit_x=track.points[-1][0],
-            start_y=track.points[0][1],
             exit_y=track.points[-1][1],
+            velocity_x=vx,
+            velocity_y=vy,
         )
     )
 
@@ -373,8 +456,7 @@ def remember_passage(track: Track) -> None:
 def assign_detections_to_tracks(
     camera_id: str,
     detections: list[Detection],
-    width: int,
-    height: int,
+    now: float,
 ) -> list[tuple[Detection, Track | None]]:
     """Match detections to existing tracks globally so nearby ships don't swap IDs."""
     candidate_tracks = [
@@ -386,7 +468,7 @@ def assign_detections_to_tracks(
     scored_pairs: list[tuple[float, int, str]] = []
     for detection_index, detection in enumerate(detections):
         for track in candidate_tracks:
-            score = track_match_score(track, detection, width, height)
+            score = track_match_score(track, detection, now)
             if score > TRACK_MATCH_MIN_SCORE:
                 scored_pairs.append((score, detection_index, track.id))
 
@@ -405,43 +487,62 @@ def assign_detections_to_tracks(
     return [(detections[index], assignments[index]) for index in range(len(detections))]
 
 
-def classify_ship_type(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> str:
-    """Classify a detected vessel using simple bbox heuristics relative to the frame."""
-    frame_height, frame_width = frame.shape[:2]
-    if frame_width <= 0 or frame_height <= 0:
+def bbox_aspect_ratio(bbox: tuple[int, int, int, int]) -> float:
+    x1, y1, x2, y2 = bbox
+    return max(1, x2 - x1) / max(1, y2 - y1)
+
+
+def track_aspect_ratio(track: Track) -> float | None:
+    """Median aspect ratio over all fully visible observations of the track."""
+    if track.aspect_samples:
+        return statistics.median(track.aspect_samples)
+    if track.best_bbox is not None:
+        return bbox_aspect_ratio(track.best_bbox)
+    if track.fallback_bbox is not None:
+        return bbox_aspect_ratio(track.fallback_bbox)
+    return None
+
+
+def classify_track(track: Track) -> str:
+    """Classify by shape: cargo ships are very elongated, sailboats are taller
+    than they are long (mast). Everything in between stays "other"."""
+    aspect_ratio = track_aspect_ratio(track)
+    if aspect_ratio is None:
         return "unknown"
 
-    x1, y1, x2, y2 = bbox
-    box_width = max(1, x2 - x1)
-    box_height = max(1, y2 - y1)
-
-    width_ratio = box_width / frame_width
-    area_ratio = (box_width * box_height) / (frame_width * frame_height)
-    aspect_ratio = box_width / box_height
-
-    if width_ratio >= CARGO_MIN_WIDTH_RATIO or area_ratio >= CARGO_MIN_AREA_RATIO:
+    if aspect_ratio >= CARGO_MIN_ASPECT_RATIO:
         return "cargo"
 
-    if width_ratio < SMALL_MAX_WIDTH_RATIO or aspect_ratio <= SAIL_MAX_ASPECT_RATIO:
-        return "pleasure_craft"
+    if aspect_ratio <= SAILBOAT_MAX_ASPECT_RATIO:
+        return "sailboat"
 
     return "other"
 
 
-def update_tracks(camera_id: str, detections: list[Detection], frame: np.ndarray) -> list[Track]:
-    now = time.time()
-    expired = [
+def expire_tracks(now: float) -> list[Track]:
+    """Drop stale tracks; return unregistered ones so callers can still register
+    ships that left the frame before meeting the normal criteria."""
+    expired_ids = [
         track_id
         for track_id, track in tracks.items()
         if now - track.last_seen > (REGISTERED_TRACK_TTL_SECONDS if track.registered else TRACK_TTL_SECONDS)
     ]
-    for track_id in expired:
-        del tracks[track_id]
 
+    expired_unregistered: list[Track] = []
+    for track_id in expired_ids:
+        track = tracks.pop(track_id)
+        if not track.registered:
+            expired_unregistered.append(track)
+
+    return expired_unregistered
+
+
+def update_tracks(camera_id: str, detections: list[Detection], frame: np.ndarray) -> list[Track]:
+    now = time.time()
     height, width = frame.shape[:2]
     changed: list[Track] = []
 
-    for detection, matched_track in assign_detections_to_tracks(camera_id, detections, width, height):
+    for detection, matched_track in assign_detections_to_tracks(camera_id, detections, now):
         cx, cy = centroid(detection.bbox)
         best_track = matched_track
 
@@ -450,18 +551,28 @@ def update_tracks(camera_id: str, detections: list[Detection], frame: np.ndarray
             tracks[best_track.id] = best_track
 
         best_track.points.append((cx, cy))
+        best_track.point_times.append(now)
         best_track.last_seen = now
         best_track.last_bbox = detection.bbox
 
         frame_center_score = center_score(cx, cy, width, height)
         best_track.best_confidence = max(best_track.best_confidence, detection.confidence)
         frame_quality = frame_quality_score(frame_center_score, detection.confidence)
+        fully_visible = is_fully_visible(detection.bbox, width, height)
 
-        if frame_quality > best_track.best_frame_quality:
-            best_track.best_frame_quality = frame_quality
-            best_track.best_center_score = frame_center_score
-            best_track.best_bbox = detection.bbox
-            best_track.best_frame = frame.copy()
+        if fully_visible:
+            best_track.aspect_samples.append(bbox_aspect_ratio(detection.bbox))
+
+            # Photos are only taken from frames where the ship is fully in view.
+            if frame_quality > best_track.best_frame_quality:
+                best_track.best_frame_quality = frame_quality
+                best_track.best_center_score = frame_center_score
+                best_track.best_bbox = detection.bbox
+                best_track.best_frame = frame.copy()
+        elif frame_quality > best_track.fallback_frame_quality:
+            best_track.fallback_frame_quality = frame_quality
+            best_track.fallback_bbox = detection.bbox
+            best_track.fallback_frame = frame.copy()
 
         changed.append(best_track)
 
@@ -496,6 +607,8 @@ def debug_tracks_for(camera_id: str) -> list[dict[str, Any]]:
             "direction": direction_for(track),
             "displacement": round(displacement_for(track), 1),
             "centerScore": round(track.best_center_score, 3),
+            "fullyVisible": track.best_frame is not None,
+            "aspectRatio": round(track_aspect_ratio(track) or 0, 2),
         }
         for track in tracks.values()
         if track.camera_id == camera_id
@@ -503,19 +616,31 @@ def debug_tracks_for(camera_id: str) -> list[dict[str, Any]]:
 
 
 def track_ready_for_registration(track: Track) -> bool:
+    """A track registers as soon as the ship has been fully in view, has moved,
+    and has enough observations. Direction is recorded but never required, so
+    slow ships and unusual headings are still captured."""
     if track.registered or len(track.points) < MIN_TRACK_FRAMES:
         return False
 
     if displacement_for(track) < MIN_TRACK_DISPLACEMENT:
         return False
 
-    if direction_for(track) == "unknown":
-        return False
-
     if track.best_frame is None:
         return False
 
     return True
+
+
+def track_qualifies_for_fallback(track: Track) -> bool:
+    """Tracks that left the frame unregistered (fast ships, or ships that were
+    never fully in view) still register if they show real movement."""
+    if track.registered or len(track.points) < FALLBACK_MIN_TRACK_FRAMES:
+        return False
+
+    if displacement_for(track) < MIN_TRACK_DISPLACEMENT:
+        return False
+
+    return track.best_frame is not None or track.fallback_frame is not None
 
 
 def pick_registration_candidates(camera_id: str) -> list[Track]:
@@ -525,23 +650,27 @@ def pick_registration_candidates(camera_id: str) -> list[Track]:
         if track.camera_id == camera_id and track_ready_for_registration(track)
     ]
 
-    if not candidates:
-        return []
-
-    centered = [track for track in candidates if track.best_center_score >= MIN_CENTER_SCORE]
-    pool = centered if centered else candidates
     return sorted(
-        pool,
+        candidates,
         key=lambda track: (track.best_frame_quality, track.best_center_score, track.best_confidence),
         reverse=True,
     )
 
 
+def registration_frame_for(track: Track) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None]:
+    if track.best_frame is not None:
+        return track.best_frame, track.best_bbox
+    return track.fallback_frame, track.fallback_bbox
+
+
 def register_track(track: Track) -> dict[str, Any]:
     passage_id = str(uuid.uuid4())
-    detected_type = detected_type_for(track)
-    photo_path = save_photo(track, passage_id, detected_type)
-    insert_passage(passage_id, track, photo_path, detected_type)
+    detected_type = classify_track(track)
+    frame, bbox = registration_frame_for(track)
+    annotated = annotated_photo(frame, bbox, detected_type)
+    photo_path = save_photo(annotated, passage_id)
+    photo_data = encode_photo(annotated)
+    insert_passage(passage_id, track, photo_path, detected_type, bbox)
     track.registered = True
     remember_passage(track)
 
@@ -551,7 +680,10 @@ def register_track(track: Track) -> dict[str, Any]:
         "confidence": round(track.best_confidence, 4),
         "detectedType": detected_type,
         "photoPath": photo_path,
-        "bbox": list(track.best_bbox) if track.best_bbox else None,
+        "photoData": photo_data,
+        "bbox": list(bbox) if bbox else None,
+        "fullyVisible": track.best_frame is not None,
+        "aspectRatio": round(track_aspect_ratio(track) or 0, 3),
         "centerScore": round(track.best_center_score, 4),
     }
 
@@ -584,31 +716,50 @@ def draw_ship_bbox(frame: np.ndarray, bbox: tuple[int, int, int, int], ship_type
     )
 
 
-def save_photo(track: Track, passage_id: str, detected_type: str) -> str | None:
-    if track.best_frame is None:
+def annotated_photo(
+    frame: np.ndarray | None,
+    bbox: tuple[int, int, int, int] | None,
+    detected_type: str,
+) -> np.ndarray | None:
+    if frame is None:
+        return None
+
+    annotated = frame.copy()
+    if bbox:
+        draw_ship_bbox(annotated, bbox, detected_type)
+    return annotated
+
+
+def save_photo(annotated: np.ndarray | None, passage_id: str) -> str | None:
+    if annotated is None:
         return None
 
     photo_path = PHOTO_DIR / f"{passage_id}.jpg"
-    frame = track.best_frame.copy()
-
-    if track.best_bbox:
-        draw_ship_bbox(frame, track.best_bbox, detected_type)
-
-    cv2.imwrite(str(photo_path), frame)
+    cv2.imwrite(str(photo_path), annotated)
     return str(photo_path)
 
 
-def detected_type_for(track: Track) -> str:
-    if track.best_frame is None or track.best_bbox is None:
-        return "unknown"
-    return classify_ship_type(track.best_frame, track.best_bbox)
+def encode_photo(annotated: np.ndarray | None) -> str | None:
+    if annotated is None:
+        return None
+
+    ok, buffer = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, PHOTO_JPEG_QUALITY])
+    if not ok:
+        return None
+    return base64.b64encode(buffer.tobytes()).decode("ascii")
 
 
-def insert_passage(passage_id: str, track: Track, photo_path: str | None, detected_type: str) -> None:
+def insert_passage(
+    passage_id: str,
+    track: Track,
+    photo_path: str | None,
+    detected_type: str,
+    photo_bbox: tuple[int, int, int, int] | None,
+) -> None:
     if not DATABASE_URL:
         return
 
-    bbox = list(track.best_bbox or (0, 0, 0, 0))
+    bbox = list(photo_bbox or (0, 0, 0, 0))
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -646,15 +797,19 @@ def health():
         "database": bool(DATABASE_URL),
         "registersPassages": DETECTION_MODE != "motion" or REGISTER_MOTION_PASSAGES,
         "shipClasses": sorted(SHIP_CLASS_NAMES),
+        "minTrackFrames": MIN_TRACK_FRAMES,
+        "fallbackMinTrackFrames": FALLBACK_MIN_TRACK_FRAMES,
         "minTrackDisplacement": MIN_TRACK_DISPLACEMENT,
         "trackTtlSeconds": TRACK_TTL_SECONDS,
         "registeredTrackTtlSeconds": REGISTERED_TRACK_TTL_SECONDS,
-        "minCenterScore": MIN_CENTER_SCORE,
+        "edgeMarginRatio": EDGE_MARGIN_RATIO,
         "centerZoneX": [CENTER_X_MIN, CENTER_X_MAX],
         "centerZoneY": [CENTER_Y_MIN, CENTER_Y_MAX],
         "passageCooldownSeconds": PASSAGE_COOLDOWN_SECONDS,
-        "passageCooldownYDistance": PASSAGE_COOLDOWN_Y_DISTANCE,
-        "shipTypeClassification": "heuristic",
+        "passageDuplicateDistance": PASSAGE_DUPLICATE_DISTANCE,
+        "shipTypeClassification": "aspect_ratio",
+        "cargoMinAspectRatio": CARGO_MIN_ASPECT_RATIO,
+        "sailboatMaxAspectRatio": SAILBOAT_MAX_ASPECT_RATIO,
         "shipTypes": list(SHIP_TYPES),
     }
 
@@ -663,6 +818,7 @@ def health():
 async def detect_frame(frame: UploadFile = File(...), cameraId: str = Form("local-browser")):
     contents = await frame.read()
     image = decode_frame(contents)
+    expired_tracks = expire_tracks(time.time())
     detections = detect_motion(cameraId, image) if DETECTION_MODE == "motion" else detect_ships(image)
     update_tracks(cameraId, detections, image)
     passages: list[dict[str, Any]] = []
@@ -673,6 +829,12 @@ async def detect_frame(frame: UploadFile = File(...), cameraId: str = Form("loca
             if track.camera_id == cameraId and not track.registered and len(track.points) >= MIN_TRACK_FRAMES:
                 track.registered = True
     else:
+        # Safety net: ships that left the frame before they were fully visible
+        # (or moved too fast for the normal criteria) are still registered once.
+        for track in expired_tracks:
+            if track_qualifies_for_fallback(track) and not is_duplicate_passage(track):
+                passages.append(register_track(track))
+
         for candidate in pick_registration_candidates(cameraId):
             if is_duplicate_passage(candidate):
                 candidate.registered = True

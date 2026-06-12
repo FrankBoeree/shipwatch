@@ -3,6 +3,7 @@ import type { ShipType } from "@/lib/types";
 
 const badgeStyles: Record<ShipType, string> = {
   pleasure_craft: "bg-sky-100 text-sky-950 ring-sky-200",
+  sailboat: "bg-emerald-100 text-emerald-950 ring-emerald-200",
   cargo: "bg-amber-100 text-amber-950 ring-amber-200",
   ferry: "bg-violet-100 text-violet-950 ring-violet-200",
   container: "bg-orange-100 text-orange-950 ring-orange-200",

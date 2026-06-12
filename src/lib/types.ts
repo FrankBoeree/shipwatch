@@ -1,5 +1,6 @@
 export type ShipType =
   | "pleasure_craft"
+  | "sailboat"
   | "cargo"
   | "container"
   | "tanker"
@@ -58,6 +59,7 @@ export type StatsSummary = {
 
 export const shipTypeLabels: Record<ShipType, string> = {
   pleasure_craft: "Pleziervaart",
+  sailboat: "Zeilboot",
   cargo: "Vrachtschip",
   container: "Containerschip",
   tanker: "Tanker",
