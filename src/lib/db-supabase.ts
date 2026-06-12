@@ -1,6 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Passage, PassageTimeBucket, Ship, StatsSummary, TimeGranularity } from "./types";
-import { aggregatePassagesByPeriod, limitBuckets } from "./passage-stats";
+import type { DashboardPassageEvent } from "./dashboard-stats";
+import { aggregatePassagesByPeriod, getAmsterdamDateKey, getPeriodKey, limitBuckets } from "./passage-stats";
 import { getSupabaseAdmin } from "./supabase-admin";
 
 type ShipEmbed = { name: string | null; mmsi: string | null };
@@ -60,6 +61,31 @@ export async function listPassagesFromSupabase(
   if (error) return null;
 
   return (data as unknown as PassageRow[]).map((row) => mapSupabasePassage(row, mapPassage));
+}
+
+export async function listPassagesPageFromSupabase(
+  offset: number,
+  limit: number,
+  mapPassage: (row: Record<string, unknown>) => Passage,
+): Promise<{ passages: Passage[]; total: number } | null> {
+  const supabase = getSupabaseReader();
+  if (!supabase) return null;
+
+  const { data, error, count } = await supabase
+    .from("public_passages")
+    .select(
+      "id, ship_id, occurred_at, direction, detection_confidence, detected_type, identification_status, photo_url, public_ships(name, mmsi)",
+      { count: "exact" },
+    )
+    .order("occurred_at", { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (error) return null;
+
+  return {
+    passages: (data as unknown as PassageRow[]).map((row) => mapSupabasePassage(row, mapPassage)),
+    total: count ?? 0,
+  };
 }
 
 export async function getPassageFromSupabase(
@@ -130,12 +156,47 @@ export async function getPassagesOverTimeFromSupabase(
   return limitBuckets(aggregatePassagesByPeriod(data, granularity), granularity);
 }
 
+export async function getDashboardEventsFromSupabase(): Promise<DashboardPassageEvent[] | null> {
+  const supabase = getSupabaseReader();
+  if (!supabase) return null;
+
+  const since = new Date(Date.now() - 370 * 24 * 60 * 60 * 1000).toISOString();
+  const pageSize = 1000;
+  const events: DashboardPassageEvent[] = [];
+
+  // Supabase caps responses at 1000 rows, so page through the result set.
+  for (let page = 0; page < 50; page += 1) {
+    const { data, error } = await supabase
+      .from("public_passages")
+      .select("occurred_at, direction, detected_type, ship_id")
+      .gte("occurred_at", since)
+      .order("occurred_at", { ascending: true })
+      .range(page * pageSize, (page + 1) * pageSize - 1);
+
+    if (error) return page === 0 ? null : events;
+    if (!data || data.length === 0) break;
+
+    for (const row of data) {
+      events.push({
+        occurred_at: String(row.occurred_at),
+        direction: String(row.direction ?? "unknown"),
+        detected_type: String(row.detected_type ?? "unknown"),
+        ship_id: row.ship_id ? String(row.ship_id) : null,
+      });
+    }
+
+    if (data.length < pageSize) break;
+  }
+
+  return events;
+}
+
 export async function getStatsSummaryFromSupabase(): Promise<StatsSummary | null> {
   const supabase = getSupabaseReader();
   if (!supabase) return null;
 
   const [passagesResult, shipsResult] = await Promise.all([
-    supabase.from("public_passages").select("occurred_at, detected_type, ship_id"),
+    supabase.from("public_passages").select("occurred_at, detected_type, ship_id, direction"),
     supabase
       .from("public_ships")
       .select("id, name, mmsi, passage_count")
@@ -154,10 +215,14 @@ export async function getStatsSummaryFromSupabase(): Promise<StatsSummary | null
   const byType = new Map<string, number>();
   let newShips = 0;
   let returningShips = 0;
+  let passagesTodayTotal = 0;
+  let towardIJmuiden = 0;
+  let towardIJmeer = 0;
+  const todayKey = getAmsterdamDateKey();
 
   for (const passage of passages) {
     const occurredAt = new Date(passage.occurred_at);
-    const dateKey = occurredAt.toISOString().slice(0, 10);
+    const dateKey = getPeriodKey(passage.occurred_at, "day");
     const hourKey = `${String(occurredAt.getUTCHours()).padStart(2, "0")}:00`;
 
     daily.set(dateKey, (daily.get(dateKey) ?? 0) + 1);
@@ -169,6 +234,15 @@ export async function getStatsSummaryFromSupabase(): Promise<StatsSummary | null
       newShips += 1;
     } else {
       returningShips += 1;
+    }
+
+    if (dateKey === todayKey) {
+      passagesTodayTotal += 1;
+      if (passage.direction === "right_to_left") {
+        towardIJmuiden += 1;
+      } else if (passage.direction === "left_to_right") {
+        towardIJmeer += 1;
+      }
     }
   }
 
@@ -192,6 +266,11 @@ export async function getStatsSummaryFromSupabase(): Promise<StatsSummary | null
       passageCount: ship.passage_count ?? 0,
     })),
     newVsReturning: { newShips, returningShips },
+    passagesToday: {
+      total: passagesTodayTotal,
+      towardIJmuiden,
+      towardIJmeer,
+    },
   };
 }
 

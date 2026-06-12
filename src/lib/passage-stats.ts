@@ -16,6 +16,11 @@ function toDateKey(year: number, month: number, day: number) {
   return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 
+export function getAmsterdamDateKey(value: Date = new Date()) {
+  const { year, month, day } = amsterdamDateParts(value);
+  return toDateKey(year, month, day);
+}
+
 export function getPeriodKey(occurredAt: string, granularity: TimeGranularity): string {
   const { year, month, day } = amsterdamDateParts(new Date(occurredAt));
 

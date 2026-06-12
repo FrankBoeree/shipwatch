@@ -17,6 +17,12 @@ export function formatTime(value: string) {
   }).format(new Date(value));
 }
 
+const countFormatter = new Intl.NumberFormat("nl-NL");
+
+export function formatCount(value: number) {
+  return countFormatter.format(value);
+}
+
 export function formatPercent(value: number) {
   return `${Math.round(value * 100)}%`;
 }

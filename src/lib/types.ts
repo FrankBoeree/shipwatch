@@ -55,6 +55,11 @@ export type StatsSummary = {
   passagesPerShipType: Array<{ shipType: ShipType; passageCount: number }>;
   mostFrequentShips: Array<{ shipId: string; name: string; passageCount: number }>;
   newVsReturning: { newShips: number; returningShips: number };
+  passagesToday: {
+    total: number;
+    towardIJmuiden: number;
+    towardIJmeer: number;
+  };
 };
 
 export const shipTypeLabels: Record<ShipType, string> = {
@@ -76,3 +81,8 @@ export const directionLabels: Record<Direction, string> = {
   right_to_left: "Rechts naar links",
   unknown: "Onbekend",
 };
+
+export const directionDestinationLabels = {
+  towardIJmuiden: "Richting IJmuiden",
+  towardIJmeer: "Richting IJmeer",
+} as const;

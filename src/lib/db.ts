@@ -2,15 +2,18 @@ import { Pool } from "pg";
 import path from "path";
 import type { Passage, PassageTimeBucket, Ship, StatsSummary, TimeGranularity } from "./types";
 import {
+  getDashboardEventsFromSupabase,
   getLiveSnapshotFromSupabase,
   getPassageFromSupabase,
   getPassagesOverTimeFromSupabase,
   getShipFromSupabase,
   getStatsSummaryFromSupabase,
   listPassagesFromSupabase,
+  listPassagesPageFromSupabase,
   listShipsFromSupabase,
 } from "./db-supabase";
-import { mockPassages, mockPassagesOverTime, mockShips, mockStats } from "./mock-data";
+import type { DashboardPassageEvent } from "./dashboard-stats";
+import { mockDashboardEvents, mockPassages, mockPassagesOverTime, mockShips, mockStats } from "./mock-data";
 
 let pool: Pool | null = null;
 
@@ -90,6 +93,47 @@ export async function listPassages(limit = 30): Promise<Passage[]> {
   }
 
   return mockPassages.slice(0, limit);
+}
+
+export async function listPassagesPage(
+  page: number,
+  pageSize: number,
+): Promise<{ passages: Passage[]; total: number }> {
+  const offset = (page - 1) * pageSize;
+  const db = getPool();
+
+  if (db) {
+    try {
+      const result = await db.query(
+        `select p.id, p.ship_id, p.occurred_at, p.direction, p.detection_confidence,
+                p.detected_type, p.identification_status, p.photo_url,
+                s.name as ship_name, s.mmsi,
+                count(*) over()::int as total_count
+           from public_passages p
+           left join public_ships s on s.id = p.ship_id
+          order by p.occurred_at desc
+          limit $1 offset $2`,
+        [pageSize, offset],
+      );
+
+      return {
+        passages: result.rows.map(mapPassage),
+        total: Number(result.rows[0]?.total_count ?? 0),
+      };
+    } catch {
+      // Fall back to Supabase when local Postgres is unavailable or misconfigured.
+    }
+  }
+
+  const fromSupabase = await listPassagesPageFromSupabase(offset, pageSize, mapPassage);
+  if (fromSupabase) {
+    return fromSupabase;
+  }
+
+  return {
+    passages: mockPassages.slice(offset, offset + pageSize),
+    total: mockPassages.length,
+  };
 }
 
 export async function getPassage(id: string): Promise<Passage | null> {
@@ -244,7 +288,7 @@ export async function getStatsSummary(): Promise<StatsSummary> {
 
   if (db) {
     try {
-      const [daily, hourly, byType, frequent, newReturning] = await Promise.all([
+      const [daily, hourly, byType, frequent, newReturning, today] = await Promise.all([
         db.query(
           `select occurred_at::date::text as date, count(*)::int as passage_count
              from public_passages
@@ -278,6 +322,15 @@ export async function getStatsSummary(): Promise<StatsSummary> {
            from public_passages p
            left join public_ships s on s.id = p.ship_id`,
         ),
+        db.query(
+          `select
+             count(*)::int as total,
+             count(*) filter (where direction = 'right_to_left')::int as toward_ijmuiden,
+             count(*) filter (where direction = 'left_to_right')::int as toward_ijmeer
+           from public_passages
+          where (occurred_at at time zone 'Europe/Amsterdam')::date
+              = (now() at time zone 'Europe/Amsterdam')::date`,
+        ),
       ]);
 
       return {
@@ -302,6 +355,11 @@ export async function getStatsSummary(): Promise<StatsSummary> {
           newShips: Number(newReturning.rows[0]?.new_ships ?? 0),
           returningShips: Number(newReturning.rows[0]?.returning_ships ?? 0),
         },
+        passagesToday: {
+          total: Number(today.rows[0]?.total ?? 0),
+          towardIJmuiden: Number(today.rows[0]?.toward_ijmuiden ?? 0),
+          towardIJmeer: Number(today.rows[0]?.toward_ijmeer ?? 0),
+        },
       };
     } catch {
       // Fall back to Supabase when local Postgres is unavailable or misconfigured.
@@ -314,6 +372,37 @@ export async function getStatsSummary(): Promise<StatsSummary> {
   }
 
   return mockStats;
+}
+
+export async function getDashboardEvents(): Promise<DashboardPassageEvent[]> {
+  const db = getPool();
+
+  if (db) {
+    try {
+      const result = await db.query(
+        `select occurred_at, direction, detected_type, ship_id
+           from public_passages
+          where occurred_at >= now() - interval '370 days'
+          order by occurred_at asc`,
+      );
+
+      return result.rows.map((row) => ({
+        occurred_at: new Date(String(row.occurred_at)).toISOString(),
+        direction: String(row.direction ?? "unknown"),
+        detected_type: String(row.detected_type ?? "unknown"),
+        ship_id: row.ship_id ? String(row.ship_id) : null,
+      }));
+    } catch {
+      // Fall back to Supabase when local Postgres is unavailable or misconfigured.
+    }
+  }
+
+  const fromSupabase = await getDashboardEventsFromSupabase();
+  if (fromSupabase) {
+    return fromSupabase;
+  }
+
+  return mockDashboardEvents;
 }
 
 export async function getLiveSnapshot() {

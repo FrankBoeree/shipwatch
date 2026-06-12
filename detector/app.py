@@ -42,6 +42,13 @@ VELOCITY_WINDOW = int(os.getenv("VELOCITY_WINDOW", "6"))
 # A ship counts as fully visible when its bbox stays this fraction of the frame
 # size away from every frame edge.
 EDGE_MARGIN_RATIO = float(os.getenv("EDGE_MARGIN_RATIO", "0.015"))
+# A bbox clear of the edges is not enough: while a ship is still entering the
+# frame (or emerging from behind an obstruction) the detector draws a box
+# around only the visible part, and that box grows every frame. The ship only
+# counts as fully in view once its bbox width has been stable for a window of
+# consecutive observations.
+SIZE_STABLE_WINDOW = int(os.getenv("SIZE_STABLE_WINDOW", "4"))
+SIZE_STABLE_TOLERANCE = float(os.getenv("SIZE_STABLE_TOLERANCE", "0.10"))
 DETECTION_MODE = os.getenv("DETECTION_MODE", "yolo")
 SHIP_CLASS_NAMES = {"boat", "ship"}
 MOTION_MIN_AREA = int(os.getenv("MOTION_MIN_AREA", "4500"))
@@ -50,6 +57,19 @@ REGISTER_MOTION_PASSAGES = os.getenv("REGISTER_MOTION_PASSAGES", "false").lower(
 # than they are long. Everything in between stays "other".
 CARGO_MIN_ASPECT_RATIO = float(os.getenv("CARGO_MIN_ASPECT_RATIO", "3.0"))
 SAILBOAT_MAX_ASPECT_RATIO = float(os.getenv("SAILBOAT_MAX_ASPECT_RATIO", "0.9"))
+# YOLO often recognises only part of a long, flat-hulled vessel (the wheelhouse
+# or bow) as a boat. The whole hull moves though, so motion regions on the same
+# horizontal band that touch the YOLO box are used to stretch it along the
+# vessel, and multiple partial detections of the same vessel are merged.
+MOTION_EXTENSION_ENABLED = os.getenv("MOTION_EXTENSION_ENABLED", "true").lower() == "true"
+MOTION_EXTENSION_MIN_AREA = int(os.getenv("MOTION_EXTENSION_MIN_AREA", "400"))
+# Max vertical growth (fraction of original bbox height per side) when motion
+# regions stretch a box; keeps wakes and reflections from inflating the height.
+MOTION_EXTENSION_MAX_HEIGHT_GROWTH = float(os.getenv("MOTION_EXTENSION_MAX_HEIGHT_GROWTH", "0.5"))
+# Boxes on the same band closer together than this fraction of the frame width
+# are considered parts of the same vessel.
+SHIP_MERGE_MAX_GAP_RATIO = float(os.getenv("SHIP_MERGE_MAX_GAP_RATIO", "0.05"))
+SHIP_MERGE_MIN_VERTICAL_OVERLAP = float(os.getenv("SHIP_MERGE_MIN_VERTICAL_OVERLAP", "0.35"))
 PHOTO_JPEG_QUALITY = int(os.getenv("PHOTO_JPEG_QUALITY", "82"))
 SHIP_TYPES = ("cargo", "sailboat", "other", "unknown")
 SHIP_TYPE_LABELS = {
@@ -86,7 +106,10 @@ class Track:
     last_seen: float
     points: list[tuple[float, float]] = field(default_factory=list)
     point_times: list[float] = field(default_factory=list)
-    # Aspect ratios sampled only from fully visible bboxes (reliable shape info).
+    # Bbox width per observation, used to detect when the ship stops "growing"
+    # (i.e. has fully entered the frame).
+    width_history: list[float] = field(default_factory=list)
+    # Aspect ratios sampled only from fully visible, size-stable bboxes.
     aspect_samples: list[float] = field(default_factory=list)
     best_confidence: float = 0
     best_center_score: float = 0
@@ -160,10 +183,131 @@ def in_roi(center_x: float, center_y: float, width: int, height: int) -> bool:
     return left * width <= center_x <= right * width and top * height <= center_y <= bottom * height
 
 
-def detect_ships(frame: np.ndarray) -> list[Detection]:
-    if DETECTION_MODE == "motion":
-        return detect_motion("local-browser", frame)
+def vertical_overlap_ratio(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    top = max(a[1], b[1])
+    bottom = min(a[3], b[3])
+    if bottom <= top:
+        return 0.0
+    height_a = max(1, a[3] - a[1])
+    height_b = max(1, b[3] - b[1])
+    return (bottom - top) / min(height_a, height_b)
 
+
+def horizontal_gap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    """Pixels between two boxes horizontally; 0 when they overlap."""
+    if a[0] > b[2]:
+        return float(a[0] - b[2])
+    if b[0] > a[2]:
+        return float(b[0] - a[2])
+    return 0.0
+
+
+def motion_regions(camera_id: str, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Small-grain moving regions, used to stretch YOLO boxes along a hull."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (21, 21), 0)
+
+    previous = backgrounds.get(camera_id)
+    backgrounds[camera_id] = gray
+
+    if previous is None:
+        return []
+
+    delta = cv2.absdiff(previous, gray)
+    threshold = cv2.threshold(delta, 28, 255, cv2.THRESH_BINARY)[1]
+    threshold = cv2.dilate(threshold, None, iterations=2)
+    contours, _ = cv2.findContours(threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    regions: list[tuple[int, int, int, int]] = []
+    for contour in contours:
+        if cv2.contourArea(contour) < MOTION_EXTENSION_MIN_AREA:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        regions.append((x, y, x + w, y + h))
+
+    return regions
+
+
+def extend_bbox_with_motion(
+    bbox: tuple[int, int, int, int],
+    regions: list[tuple[int, int, int, int]],
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    """Stretch a YOLO box along the vessel using adjacent motion regions.
+
+    YOLO frequently boxes only the superstructure of a long flat hull. The
+    whole hull moves coherently, so moving regions whose vertical center lies
+    on the same band and that touch (or nearly touch) the box horizontally are
+    absorbed. Vertical growth is capped so wakes don't inflate the height.
+    """
+    orig_x1, orig_y1, orig_x2, orig_y2 = bbox
+    box_h = max(1, orig_y2 - orig_y1)
+    band_top = orig_y1 - box_h * 0.3
+    band_bottom = orig_y2 + box_h * 0.3
+    min_y1 = orig_y1 - box_h * MOTION_EXTENSION_MAX_HEIGHT_GROWTH
+    max_y2 = orig_y2 + box_h * MOTION_EXTENSION_MAX_HEIGHT_GROWTH
+    max_gap = width * SHIP_MERGE_MAX_GAP_RATIO
+
+    x1, y1, x2, y2 = orig_x1, orig_y1, orig_x2, orig_y2
+    used: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for index, region in enumerate(regions):
+            if index in used:
+                continue
+            region_cy = (region[1] + region[3]) / 2
+            if not band_top <= region_cy <= band_bottom:
+                continue
+            if horizontal_gap((x1, y1, x2, y2), region) > max_gap:
+                continue
+            x1 = min(x1, region[0])
+            x2 = max(x2, region[2])
+            y1 = int(max(min(y1, region[1]), min_y1))
+            y2 = int(min(max(y2, region[3]), max_y2))
+            used.add(index)
+            changed = True
+
+    return (max(0, x1), max(0, y1), min(width, x2), min(height, y2))
+
+
+def merge_ship_detections(detections: list[Detection], frame_width: int) -> list[Detection]:
+    """Merge partial detections of the same vessel (bow, wheelhouse, stern)
+    that sit on the same horizontal band close together."""
+    max_gap = frame_width * SHIP_MERGE_MAX_GAP_RATIO
+    merged = list(detections)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(merged)):
+            for j in range(i + 1, len(merged)):
+                a, b = merged[i], merged[j]
+                if (
+                    vertical_overlap_ratio(a.bbox, b.bbox) >= SHIP_MERGE_MIN_VERTICAL_OVERLAP
+                    and horizontal_gap(a.bbox, b.bbox) <= max_gap
+                ):
+                    union = (
+                        min(a.bbox[0], b.bbox[0]),
+                        min(a.bbox[1], b.bbox[1]),
+                        max(a.bbox[2], b.bbox[2]),
+                        max(a.bbox[3], b.bbox[3]),
+                    )
+                    merged[i] = Detection(
+                        label=a.label,
+                        confidence=max(a.confidence, b.confidence),
+                        bbox=union,
+                    )
+                    del merged[j]
+                    changed = True
+                    break
+            if changed:
+                break
+
+    return merged
+
+
+def detect_ships(camera_id: str, frame: np.ndarray) -> list[Detection]:
     detector = get_model()
 
     if detector is None:
@@ -222,7 +366,22 @@ def detect_ships(frame: np.ndarray) -> list[Detection]:
             Detection(label=labels[i], confidence=confidences[i], bbox=(x, y, x + box_w, y + box_h))
         )
 
-    return detections
+    if detections and MOTION_EXTENSION_ENABLED:
+        regions = motion_regions(camera_id, frame)
+        detections = [
+            Detection(
+                label=item.label,
+                confidence=item.confidence,
+                bbox=extend_bbox_with_motion(item.bbox, regions, width, height),
+            )
+            for item in detections
+        ]
+    elif MOTION_EXTENSION_ENABLED:
+        # Keep the motion background up to date even without detections, so the
+        # frame diff is fresh the moment a ship appears.
+        motion_regions(camera_id, frame)
+
+    return merge_ship_detections(detections, width)
 
 
 def detect_motion(camera_id: str, frame: np.ndarray) -> list[Detection]:
@@ -332,6 +491,23 @@ def is_fully_visible(bbox: tuple[int, int, int, int], width: int, height: int) -
         and x2 <= width - margin_x
         and y2 <= height - margin_y
     )
+
+
+def size_is_stable(track: Track) -> bool:
+    """True once the bbox width has stopped growing for a full window.
+
+    A ship entering the frame (or emerging from behind an obstruction) shows a
+    growing bbox around its visible part; only when the width settles do we
+    know the whole ship is in view.
+    """
+    if len(track.width_history) < SIZE_STABLE_WINDOW:
+        return False
+
+    window = track.width_history[-SIZE_STABLE_WINDOW:]
+    largest = max(window)
+    if largest <= 0:
+        return False
+    return (largest - min(window)) / largest <= SIZE_STABLE_TOLERANCE
 
 
 def track_velocity(track: Track) -> tuple[float, float]:
@@ -554,16 +730,21 @@ def update_tracks(camera_id: str, detections: list[Detection], frame: np.ndarray
         best_track.point_times.append(now)
         best_track.last_seen = now
         best_track.last_bbox = detection.bbox
+        x1, _, x2, _ = detection.bbox
+        best_track.width_history.append(float(max(1, x2 - x1)))
 
         frame_center_score = center_score(cx, cy, width, height)
         best_track.best_confidence = max(best_track.best_confidence, detection.confidence)
         frame_quality = frame_quality_score(frame_center_score, detection.confidence)
         fully_visible = is_fully_visible(detection.bbox, width, height)
 
-        if fully_visible:
+        # A photo only counts as "ship fully in view" when the bbox is clear of
+        # the frame edges AND its size has stopped growing: a ship that is
+        # still entering the frame shows a smaller, growing box around just the
+        # visible part, which would otherwise pass the edge check.
+        if fully_visible and size_is_stable(best_track):
             best_track.aspect_samples.append(bbox_aspect_ratio(detection.bbox))
 
-            # Photos are only taken from frames where the ship is fully in view.
             if frame_quality > best_track.best_frame_quality:
                 best_track.best_frame_quality = frame_quality
                 best_track.best_center_score = frame_center_score
@@ -608,6 +789,8 @@ def debug_tracks_for(camera_id: str) -> list[dict[str, Any]]:
             "displacement": round(displacement_for(track), 1),
             "centerScore": round(track.best_center_score, 3),
             "fullyVisible": track.best_frame is not None,
+            "sizeStable": size_is_stable(track),
+            "width": round(track.width_history[-1], 1) if track.width_history else 0,
             "aspectRatio": round(track_aspect_ratio(track) or 0, 2),
         }
         for track in tracks.values()
@@ -803,6 +986,10 @@ def health():
         "trackTtlSeconds": TRACK_TTL_SECONDS,
         "registeredTrackTtlSeconds": REGISTERED_TRACK_TTL_SECONDS,
         "edgeMarginRatio": EDGE_MARGIN_RATIO,
+        "sizeStableWindow": SIZE_STABLE_WINDOW,
+        "sizeStableTolerance": SIZE_STABLE_TOLERANCE,
+        "motionExtension": MOTION_EXTENSION_ENABLED,
+        "shipMergeMaxGapRatio": SHIP_MERGE_MAX_GAP_RATIO,
         "centerZoneX": [CENTER_X_MIN, CENTER_X_MAX],
         "centerZoneY": [CENTER_Y_MIN, CENTER_Y_MAX],
         "passageCooldownSeconds": PASSAGE_COOLDOWN_SECONDS,
@@ -819,7 +1006,7 @@ async def detect_frame(frame: UploadFile = File(...), cameraId: str = Form("loca
     contents = await frame.read()
     image = decode_frame(contents)
     expired_tracks = expire_tracks(time.time())
-    detections = detect_motion(cameraId, image) if DETECTION_MODE == "motion" else detect_ships(image)
+    detections = detect_motion(cameraId, image) if DETECTION_MODE == "motion" else detect_ships(cameraId, image)
     update_tracks(cameraId, detections, image)
     passages: list[dict[str, Any]] = []
     registration_enabled = DETECTION_MODE == "yolo" or REGISTER_MOTION_PASSAGES
