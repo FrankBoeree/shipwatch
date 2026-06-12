@@ -2,9 +2,8 @@ import { AppShell } from "@/components/app-shell";
 import { HomeDashboard } from "@/components/dashboard/home-dashboard";
 import { buildDashboardStats } from "@/lib/dashboard-stats";
 import { getDashboardEvents, getLiveSnapshot, getStatsSummary, listPassages, listShips } from "@/lib/db";
-import { VIEWER_REVALIDATE_SECONDS } from "@/lib/viewer-cache";
 
-export const revalidate = VIEWER_REVALIDATE_SECONDS;
+export const revalidate = 15;
 
 export default async function Home() {
   const [passages, stats, snapshot, events, ships] = await Promise.all([
